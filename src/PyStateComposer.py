@@ -1,5 +1,5 @@
 #    "$Name: not supported by cvs2svn $";
-#    "$Header: /users/chaize/newsvn/cvsroot/Calculation/PyStateComposer/src/PyStateComposer.py,v 1.2 2009-01-22 16:37:41 sergi_rubio Exp $";
+#    "$Header: /users/chaize/newsvn/cvsroot/Calculation/PyStateComposer/src/PyStateComposer.py,v 1.3 2009-03-10 16:38:37 sergi_rubio Exp $";
 #=============================================================================
 #
 # file :        PyStateComposer.py
@@ -14,9 +14,14 @@
 #
 # $Author: sergi_rubio $
 #
-# $Revision: 1.2 $
+# $Revision: 1.3 $
 #
 # $Log: not supported by cvs2svn $
+# Revision 1.2  2009/01/22 16:37:41  sergi_rubio
+# Now this PyStateComposer uses Miscellaneous/PyTango_utils package. It provides DynamicDS and ThreadDict for DynamicAttributes and reliable polling.
+#
+# Events has been temporariliy disabled.
+#
 # Revision 1.1.1.1  2007/10/17 16:42:52  sergi_rubio
 # A PyTango StateComposer, based on Calculation/StateComposer device
 #
@@ -41,23 +46,20 @@ import threading
 import collections
 from functools import partial
 from copy import *
-from PyTango_utils import dynamic,dicts
-#from PyTango_utils import device #@warning importing PyTango_utils.device caused misbehaviours when closing the device server
+from PyTango_utils.interface import FullTangoInheritance
+from PyTango_utils.dynamic import DynamicDS,DynamicDSClass,DynamicAttribute
+from PyTango_utils.dicts import DefaultThreadDict
 
 """
-@mainpage @package PyStateComposer Tango Device Server
+@mainpage PyStateComposer Tango Device Server
 
-@attention Now is temporariliy disabled but in feature releases PyTango_utils.callbacks will be on charge of managing EventsList, EventReceivers, 
-AttributesList, StatesList, EventStruct, EventCallback, GlobalCallback objects
-
+@attention This device will use in future releases the tau.core packages to manage events and attributes configuration.
 This is because several PyTango device servers are sharing this features
 
-@section Usage
-
-The device server is configured using ...
 """
 
-## AUXILIARY CLASSES:
+## @name AUXILIARY CLASSES:
+# @{
 
 class defaultdict_fromkey(collections.defaultdict):
     """ This class allows to create dictionaries with default values generated using the key value. """
@@ -100,32 +102,52 @@ class forcedEvent(object):
         self.err=err
         self.errors=errors        
 
+## @}
 
 #==================================================================
 #   PyStateComposer Class Description:
 #
+#         PyStateComposer allows to create a new composed State or Attributes using the State and Attributes from a list of devices: <ul>
+#         <li>When a new Device is added the composer subscribes to its State changes.</li>
+#         <li>If it is not able to subscribe to events, then a polling thread is started.</li>
+#         <li>relays on PyTango_utils package to provide DynamicAttributes and DynamicStates.</li>
+#         <li>Either StatePolicy or DynamicStates property can be used to compose the State.</li>
+#         <li>StatePolicy uses the same format than Soleil's composer, the default policy is generated the first time the composer is launched</li>
+#         </ul>
 #
 #==================================================================
 
 
-#class PyStateComposer(PyTango.Device_3Impl):
-class PyStateComposer(dynamic.DynamicDS):
-#class PyStateComposer(device.Dev4Tango,dynamic.DynamicDS):
-    '''   
-    PyStateComposer is completely based on PyTango_utils.callbacks package:
-    @li When a new Device is added the composer subscribes to its State changes.
-    @li Device/State is added to callbacks.EventsList; and the composer is assigned to EventsList[Device/State].receivers list.
-    @li The object callbacks.GlobalCallback receives all subscribed events and then distributes to registered receivers (PyStateComposer.push_event).
-    @li callbacks.AttributesList and StatesList are caches of the last values received.
-    
-    @todo A not-event driven version of PyStateComposer must be developed ... to provide StateComposing even when notifd crashes
-    @todo ThreadDict, ProxyDict and other new/style classes must be used instead of crashy devslist
-    @todo get_subscribed_devices() could be used instead of DevicesList() at many points of the code?
-    '''
+class PyStateComposer(PyTango.Device_3Impl):
 
     #--------- Add you global variables here --------------------------
+    '''   @class PyStateComposer
+    PyStateComposer allows to create a new composed State or Attributes using the State and Attributes from a list of devices: <ul>
+    <li>When a new Device is added the composer subscribes to its State changes.</li>
+    <li>If it is not able to subscribe to events, then a polling thread is started.</li>
+    <li>relays on PyTango_utils package to provide DynamicAttributes and DynamicStates.</li>
+    <li>Either StatePolicy or DynamicStates property can be used to compose the State.</li>
+    <li>StatePolicy uses the same format than Soleil's composer, the default policy is generated the first time the composer is launched</li>
+    </ul>
+    '''
+    
     TangoStates = ['ON','OFF','CLOSE','OPEN','INSERT','EXTRACT','MOVING','STANDBY','FAULT','INIT','RUNNING','ALARM','DISABLE','UNKNOWN']
     
+    def get_devs_from_db(self,dev_name):
+        """ Using a PyTango.Database object returns a list of all devices matching the given name (domain*/family*/member*)"""
+        if dev_name.count('/')<2: raise 'ThisIsNotAValidDeviceName'
+        domain,family,member = dev_name.split('/',2)
+        result = set()
+        if not hasattr(self,'db'):
+            self.db = PyTango.Database()
+        domains = self.db.get_device_domain(dev_name)
+        for d in domains:
+            families = self.db.get_device_family('%s/%s/%s'%(d,family,member))
+            for f in families:
+                members = self.db.get_device_member('%s/%s/%s'%(d,f,member))
+                [result.add('%s/%s/%s'%(d,f,m)) for m in members]
+        return result
+
     def get_subscribed_devices(self):
         '''
         It returns a list with all devices managed by callbacks to which this Composer is effectively subscribed
@@ -215,6 +237,11 @@ class PyStateComposer(dynamic.DynamicDS):
             else:
                 StatesList = dict((k,d.State) for k,d in self.DevicesList.items())
             
+            #publishing Devices and States for Dynamic Attributes and States
+            if not hasattr(self,'_locals'): setattr(self,'_locals',{})
+            self._locals['DEVICES']=StatesList.keys()
+            self._locals['STATES']=StatesList.values()
+            
             if not StatesList:
                 self.set_state(PyTango.DevState.UNKNOWN)
                 return
@@ -225,7 +252,7 @@ class PyStateComposer(dynamic.DynamicDS):
                     #print 'in ',self.get_name(),'.evaluateStates(): called for other device?!'
                     #continue
                 if self.StatePriorities[self.TangoStates[int(state)]]>self.StatePriorities[self.TangoStates[int(result)]]:
-                    self.debug('evaluating '+dev+'; Priority of '+self.TangoStates[state]+','+state+' is higher than '+self.TangoStates[result]+','+result+'; STATE CHANGES!')
+                    self.debug('evaluating %s; Priority of %s,%s is higher than %s,%s; STATE CHANGES!'%(dev,self.TangoStates[state],state,self.TangoStates[result],result))
                     result=state
                 status = status + dev + ':\t' + self.TangoStates[state]
                 
@@ -287,7 +314,7 @@ class PyStateComposer(dynamic.DynamicDS):
             self.evaluateStates()
         except Exception,e:
             self.error("Exception in push_event(): %" % traceback.format_exc())
-   
+
     def AddDeviceToList(self,argin):
         ''' @brief This method adds a new device to @bPyTango_utils.callback@b dictionaries: StatesList, EventsList, AttributesLIst ...
         @param[in] argin : the device to add; it must be an string; it can contain '*' or '?' , but not regular expressions
@@ -307,6 +334,7 @@ class PyStateComposer(dynamic.DynamicDS):
         try:
             if '*' in argin or '?' in argin:
                 devs = PyTango.Database().get_device_exported(argin)
+                self.info('AddDeviceToList: %d devices got from Database using wildcard (%s)'%(len(devs),argin))
                 for d in devs:
                     self.AddDeviceToList(d)
             else:
@@ -380,7 +408,7 @@ class PyStateComposer(dynamic.DynamicDS):
 #    Device constructor
 #------------------------------------------------------------------
     def __init__(self,cl, name):
-        self.call__init__(dynamic.DynamicDS,cl,name,_locals={},useDynStates=True)
+        self.call__init__(DynamicDS,cl,name,_locals={},useDynStates=True)
         self.call__init__(PyTango.Device_3Impl,cl,name)
         PyStateComposer.init_device(self)
 
@@ -413,7 +441,12 @@ class PyStateComposer(dynamic.DynamicDS):
         self.get_device_properties(self.get_device_class())
         self.setLogLevel(self.LogLevel if hasattr(self,'LogLevel') else 'DEBUG')
         
-        print self.get_name(),": ",        " ... parsing properties ... "
+        # If self.DevicesList property is not initialized then DeviceNameList is read instead; this is for Soleil's device compatibility
+        props = PyTango.Database().get_device_property(self.get_name(),['DeviceNameList','DevicesList'])
+        if not props['DevicesList']:
+            self.DevicesList = PyTango.Database().get_device_property(self.get_name(),['DeviceNameList'])['DeviceNameList']
+        self.DeviceNameList = self.DevicesList
+        
         self.StatePriorities = { 
             'ON':0, 
             'OFF':11, 
@@ -433,7 +466,7 @@ class PyStateComposer(dynamic.DynamicDS):
         
         #@todo srubio: PyStateManager disabled! whole concept must be redefined or deprecated @n
         #This dict will keep the names and states of devices       
-        self.DevicesList = dicts.DefaultThreadDict( 
+        self.DevicesList = DefaultThreadDict( 
             default_factory = lambda k: TDev(k), 
             timewait=.001*(self.PollingCycle/(1+len(self.DeviceNameList) or 1))
             )
@@ -457,21 +490,21 @@ class PyStateComposer(dynamic.DynamicDS):
         self.UpdateStatePolicy(read_properties = False)
         
         self.info('Updating Device Properties ...')
-        PyTango.Database().put_device_property(self.get_name(),{
-            'StatePolicy':self.StatePolicy, \
-            'DeviceNameList':self.DeviceNameList, \
+        default_props = { \
             'UseEvents':[str(self.UseEvents)], \
-            'AlwaysExecutedHook':self.AlwaysExecutedHook or [], \
+            'AlwaysExecutedHook': hasattr(self,'AlwaysExecutedHook') and self.AlwaysExecutedHook or [], \
             'PollingCycle':[self.PollingCycle], \
-            })             #'AttributeName':self.AttributeName, \
+            } 
+        if not self.DynamicStates: default_props['StatePolicy']=self.StatePolicy
+        if not props['DevicesList']: default_props['DeviceNameList']=self.DeviceNameList
+        
+        PyTango.Database().put_device_property(self.get_name(),default_props)
 
         if self.UseEvents:
             self.set_change_event('State',True,True)
             
         self.DevicesList.start()
         self.info('Ready to accept request ...')
-        
-
 
 #------------------------------------------------------------------
 #    Always excuted hook method
@@ -479,10 +512,9 @@ class PyStateComposer(dynamic.DynamicDS):
     def always_executed_hook(self):
         #print "In ", self.get_name(), "::always_executed_hook()"
         self.debug("In ::always_executed_hook()")
-        dynamic.DynamicDS.always_executed_hook(self)
-        
+            
         #This lines allow to use the AlwaysExecutedHook property to add custom code to the Device
-        if self.AlwaysExecutedHook:
+        if hasattr(self,'AlwaysExecutedHook') and self.AlwaysExecutedHook:
             code = ''
             for l in self.AlwaysExecutedHook:
                 code = code+l+'\n'
@@ -490,9 +522,11 @@ class PyStateComposer(dynamic.DynamicDS):
                 exec code
             except Exception,e:
                 self.error('Exception in Custom AlwaysExecutedHook: %s' % traceback.format_exc())
-                
+
         if not self.UseEvents:
-            self.evaluateStates()
+            self.evaluateStates() #It must be called always before DynamicDS always_executed_hook
+        
+        DynamicDS.always_executed_hook(self)
 
 
 #==================================================================
@@ -543,6 +577,7 @@ class PyStateComposer(dynamic.DynamicDS):
         attr.set_value(attr_DevicesList_read, len(attr_DevicesList_read))
 
 
+
 #==================================================================
 #
 #    PyStateComposer command methods
@@ -561,7 +596,6 @@ class PyStateComposer(dynamic.DynamicDS):
         
         #    Add your own code here
         self.AddDeviceToList(argin)
-
 
 
 #------------------------------------------------------------------
@@ -589,8 +623,6 @@ class PyStateComposer(dynamic.DynamicDS):
             self.Devices.pop(argin)
             print "\t",self.get_name(),"::RemoveDevice(",argin,"): device unsuscribed and removed from list!"
             self.evaluateStates()
-
-
 
 #------------------------------------------------------------------
 #    UpdateStatePolicy command:
@@ -634,8 +666,7 @@ class PyStateComposer(dynamic.DynamicDS):
 #    PyStateComposerClass class definition
 #
 #==================================================================
-#class PyStateComposerClass(PyTango.PyDeviceClass):
-class PyStateComposerClass(dynamic.DynamicDSClass):
+class PyStateComposerClass(PyTango.PyDeviceClass):
 
     #    Class Properties
     class_property_list = {
@@ -644,45 +675,29 @@ class PyStateComposerClass(dynamic.DynamicDSClass):
 
     #    Device Properties
     device_property_list = {
-        #'PyStateManager':
-            #[PyTango.DevString,
-            #"Manager assigned to this Composer",
-            #[] ],    
-#        'AttributesList':
-#            [PyTango.DevVarStringArray,
-#            "Global Attribute",
-#            [] ],
         'DynamicAttributes':
             [PyTango.DevVarStringArray,
-            "Attributes and formulas to create for this device.\nThis Tango Attributes will be generated dynamically using this syntax:\nT3=int(Reg(7007)/10.)\nThe commands Coil, Flag, Reg and fReg will allow to declare \nDigital, Bit, Integer and Float variables respectively.",
+            "Attributes and formulas to create for this device.<br>This Tango Attributes will be generated dynamically using this syntax:<br>&nbsp;AllPressures=DevVarLongArray([XAttr(dev+'/Pressure') or 0 for dev in DEVICES])",
             [] ],
         'DynamicStates':
             [PyTango.DevVarStringArray,
-            "This property will allow to declare new States dinamically based on\ndynamic attributes changes. The function Attr will allow to use the\nvalue of attributes in formulas.\n\nALARM=Attr(T1)>70\nOK=1",
+            "This property will allow to declare new States dinamically based on dynamic attributes changes:<br>&nbsp;FAULT=any([s==FAULT for s in STATES])<br>&nbsp;ON=1",
             [] ],
-        'ForcePolling':
-            [PyTango.DevBoolean,
-            "To force or not attribute polling on target devices.",
-            [ True ] ],
         'PollingCycle':
             [PyTango.DevLong,
             "Default period for polling all device states.",
-            [ 3000 ] ],            
+            [ 3000 ] ],
         'UseEvents':
             [PyTango.DevBoolean,
             "This property allows to enable/disable events management.",
             [ False ] ],
-        'DeviceNameList':
+        'DevicesList':
             [PyTango.DevVarStringArray,
-            "A list of device names, wildcards like domain/family/* are allowed.",
+            "A list of device names, wildcards like domain/family/* are allowed.<br>If this property is not initialized DeviceNameList is read instead.",
             [] ],
         'StatePolicy':
             [PyTango.DevVarStringArray,
-            "",
-            [] ],
-        'AlwaysExecutedHook':
-            [PyTango.DevVarStringArray,
-            "Python Code to be executed before each command execution",
+            "A list of States and its priority. this property is not used if DynamicStates has been initialized.",
             [] ],
         }
 
@@ -696,8 +711,8 @@ class PyStateComposerClass(dynamic.DynamicDSClass):
             [[PyTango.DevString, "Device to remove"],
             [PyTango.DevVoid, ""]],
         'UpdateStatePolicy':
-            [[PyTango.DevVoid, "Updates the way State is computed"],
-            [PyTango.DevVoid, "Updates the way State is computed"]],
+            [[PyTango.DevVoid, "Reloads StatePolicy from the database"],
+            [PyTango.DevVoid, ""]],
         }
 
 
@@ -736,6 +751,7 @@ class PyStateComposerClass(dynamic.DynamicDSClass):
 if __name__ == '__main__':
     try:
         py = PyTango.PyUtil(sys.argv)
+        PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
         py.add_TgClass(PyStateComposerClass,PyStateComposer,'PyStateComposer')
 
         U = PyTango.Util.instance()
@@ -745,4 +761,6 @@ if __name__ == '__main__':
     except PyTango.DevFailed,e:
         print '-------> Received a DevFailed exception:',e
     except Exception,e:
-        print' an unforeseen exception occured: ',str(e)
+        print '-------> An unforeseen exception occured....',e
+
+PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
