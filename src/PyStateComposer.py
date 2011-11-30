@@ -1,5 +1,5 @@
 #    "$Name: not supported by cvs2svn $";
-#    "$Header: /users/chaize/newsvn/cvsroot/Calculation/PyStateComposer/src/PyStateComposer.py,v 1.3 2009-03-10 16:38:37 sergi_rubio Exp $";
+#    "$Header: /users/chaize/newsvn/cvsroot/Calculation/PyStateComposer/src/PyStateComposer.py,v 1.4 2011-11-30 16:04:34 sergi_rubio Exp $";
 #=============================================================================
 #
 # file :        PyStateComposer.py
@@ -14,13 +14,13 @@
 #
 # $Author: sergi_rubio $
 #
-# $Revision: 1.3 $
+# $Revision: 1.4 $
 #
 # $Log: not supported by cvs2svn $
 # Revision 1.2  2009/01/22 16:37:41  sergi_rubio
 # Now this PyStateComposer uses Miscellaneous/PyTango_utils package. It provides DynamicDS and ThreadDict for DynamicAttributes and reliable polling.
 #
-# Events has been temporariliy disabled.
+# $Revision: 1.4 $
 #
 # Revision 1.1.1.1  2007/10/17 16:42:52  sergi_rubio
 # A PyTango StateComposer, based on Calculation/StateComposer device
@@ -38,76 +38,41 @@
 
 
 import PyTango
-import sys
-import os
-import time
-import traceback
+import sys,os,time,traceback,re
 import threading
 import collections
 from functools import partial
 from copy import *
-from PyTango_utils.interface import FullTangoInheritance
-from PyTango_utils.dynamic import DynamicDS,DynamicDSClass,DynamicAttribute
-from PyTango_utils.dicts import DefaultThreadDict
+try: import fandango
+except: import PyTango_utils as fandango
+
+import fandango.functional as fun
+from fandango import DynamicDS,DynamicDSClass,DynamicAttribute
+from fandango.interface import FullTangoInheritance
+from fandango.dynamic import CreateDynamicCommands
+from fandango.device import Dev4Tango,fakeEventType,get_matching_devices,get_database
+
+try: from tau.core.utils.containers import CaselessList
+except:
+    try: from fandango import CaselessList
+    except: CaselessList = list
+
+if "Device_4Impl" not in dir(PyTango):
+    print 'Adapting to PyTango7 ...'
+    PyTango.DeviceClass = PyTango.PyDeviceClass
+    PyTango.Device_4Impl = PyTango.Device_3Impl
 
 """
 @mainpage PyStateComposer Tango Device Server
 
-@attention This device will use in future releases the tau.core packages to manage events and attributes configuration.
-This is because several PyTango device servers are sharing this features
-
 """
 
-## @name AUXILIARY CLASSES:
-# @{
-
-class defaultdict_fromkey(collections.defaultdict):
-    """ This class allows to create dictionaries with default values generated using the key value. """
-    def __missing__(self, key):
-        if self.default_factory is None: raise KeyError(key)
-        self[key] = value = self.default_factory(key)
-        return value
-
-__lock__ = threading.RLock()
-def __locked__(f,*args,**kwargs):
-    """ decorator for secure-locked functions """
-    try:
-        __lock__.acquire()
-        return f(*args,**kwargs)
-    except Exception,e:
-        print 'Exception in%s(*%s,**%s): %s' % (f.__name__,args,kwargs,e)
-    finally:
-        __lock__.release()
-        
-class TDev:
-    """ This class keeps name,State,DeviceProxy and Event information for subscribed devices"""
-    def __init__(self,name):
-        self.name=name
-        self.event_id=None
-        self.proxy=None
-        self.State=PyTango.DevState.UNKNOWN
-        self.last_event = None
-        self.last_success = 0
-        self.next_update = time.time() #Even better ... the next epoch when this Dev should be read
-        self.lock = threading.Lock()
-    def __str__(self):
-        return str(name)+","+str(self.event_id)+","+TangoStates[self.State]+";"
-
-class forcedEvent(object):
-    """ This class allows to simulate events within the device itself """
-    def __init__(self,device,attr_name,attr_value,err,errors):
-        self.device=device
-        self.attr_name=attr_name
-        self.attr_value=attr_value
-        self.err=err
-        self.errors=errors        
-
-## @}
 
 #==================================================================
 #   PyStateComposer Class Description:
 #
-#         PyStateComposer allows to create a new composed State or Attributes using the State and Attributes from a list of devices: <ul>
+#         <p>This device requires <a href="http://www.tango-controls.org/Documents/tools/fandango/fandango">Fandango module<a> to be available in the PYTHONPATH.</p>
+#         PyStateComposer(Dev4Tango,DynamicDS) allows to create a new composed State or Attributes using the State and Attributes from a list of devices: <ul>
 #         <li>When a new Device is added the composer subscribes to its State changes.</li>
 #         <li>If it is not able to subscribe to events, then a polling thread is started.</li>
 #         <li>relays on PyTango_utils package to provide DynamicAttributes and DynamicStates.</li>
@@ -118,11 +83,11 @@ class forcedEvent(object):
 #==================================================================
 
 
-class PyStateComposer(PyTango.Device_3Impl):
+class PyStateComposer(PyTango.Device_4Impl):
 
     #--------- Add you global variables here --------------------------
     '''   @class PyStateComposer
-    PyStateComposer allows to create a new composed State or Attributes using the State and Attributes from a list of devices: <ul>
+    PyStateComposer(Dev4Tango,DynamicDS) allows to create a new composed State or Attributes using the State and Attributes from a list of devices: <ul>
     <li>When a new Device is added the composer subscribes to its State changes.</li>
     <li>If it is not able to subscribe to events, then a polling thread is started.</li>
     <li>relays on PyTango_utils package to provide DynamicAttributes and DynamicStates.</li>
@@ -131,196 +96,156 @@ class PyStateComposer(PyTango.Device_3Impl):
     </ul>
     '''
     
-    TangoStates = ['ON','OFF','CLOSE','OPEN','INSERT','EXTRACT','MOVING','STANDBY','FAULT','INIT','RUNNING','ALARM','DISABLE','UNKNOWN']
+    defaultStatePriorities = {
+            'ON':0, 
+            'OPEN':0, 
+            'EXTRACT':0, 
+            'STANDBY':0, 
+            'MOVING':8, 
+            'RUNNING':8, 
+            'CLOSE':10, 
+            'INSERT':10, 
+            'DISABLE':11, 
+            'OFF':11, 
+            'UNKNOWN':12,
+            'INIT':13, 
+            'ALARM':13, 
+            'FAULT':14, 
+            }
     
-    def get_devs_from_db(self,dev_name):
-        """ Using a PyTango.Database object returns a list of all devices matching the given name (domain*/family*/member*)"""
-        if dev_name.count('/')<2: raise 'ThisIsNotAValidDeviceName'
-        domain,family,member = dev_name.split('/',2)
-        result = set()
-        if not hasattr(self,'db'):
-            self.db = PyTango.Database()
-        domains = self.db.get_device_domain(dev_name)
-        for d in domains:
-            families = self.db.get_device_family('%s/%s/%s'%(d,family,member))
-            for f in families:
-                members = self.db.get_device_member('%s/%s/%s'%(d,f,member))
-                [result.add('%s/%s/%s'%(d,f,m)) for m in members]
-        return result
+    def event_received(self,source,type_,attr_value):
+        """
+        This method manages the events received from external attributes.
+        """
+        #self.info,debug,error,warning should not be used here to avoid conflicts with tau.core logging
+        def log(prio,s,obj=self): 
+            if obj.getLogLevel(prio)>=obj.log_obj.level:
+                print '%s %s %s: %s' % (prio.upper(),time.strftime('%Y-%m-%d %H:%M:%S',time.localtime()),obj.get_name(),s)
+        log('debug','In PyStateComposer.event_received(%s(%s),%s,%s)'%(type(source).__name__,source,fakeEventType[type_],type(attr_value).__name__))
+        self.last_event_received = time.time()
+        try:
+            source = str(source).strip().lower()
+            log('debug','source = %s'%source)
+            if 'Config'==fakeEventType[type_]:
+                log('debug','Config event ignored ... %s'%source)
+            elif '/' not in source:
+                log('info','Not-tango names ignored ... %s'%source)
+            else:
+                attr_name = '/'.join(source.split('/')[-4:]) #domain/family/member/attribute
+                dev_name,att = attr_name.rsplit('/',1) if '/' in attr_name else (attr_name,attr_name)
+                if 'Error'==fakeEventType[type_]:
+                    log('error','Error received from %s: %s'%(source, attr_value))
+                    self.AttributeCache[attr_name] = None
+                else:
+                    log('debug','Periodic/Change event received from %s'%attr_name)
+                self.AttributeCache[attr_name] = attr_value # I keep value/time/quality struct
+                value = getattr(attr_value,'value',None)
+                if att == 'state' and (self.DevicesDict.get(dev_name)!=value or 'Error'==fakeEventType[type_]):
+                    self.DevicesDict[dev_name] = fun.notNone(value,PyTango.DevState.UNKNOWN)
+                    if self.__initialized: self.evaluateStates()
+        except:
+            log('error','Exception in event_received(...):\n%s'%traceback.format_exc())
+        return
 
-    def get_subscribed_devices(self):
-        '''
-        It returns a list with all devices managed by callbacks to which this Composer is effectively subscribed
-        '''
-        if not self.UseEvents: 
-            self.warning('Events management is DISABLED!')
-            return
-        result = []
-        name = self.get_name()
-        for ev in EventsList.values():
-            if name in ev.receivers:
-                result.append (ev.dev_name)
-        return result
-    
-    #@classmethod
-    def read_remote_attribute(self,device,attribute,poll_cycle,devs_dict,bads_dict={}):
-        """
-        @param[in] poll_cycle must be specified in milliseconds!
-        This method executes a read_attribute in a remote proxy.
-        It verifies first with a ping() command if the device is working or not.
-        The devices that does not answer in the expected time are tested with a bigger period.
-        @todo In the future it will put more unresponsive devices in a separated read list (bads_dict)
-        @todo could be TDev.lock.acquire(),release() calls necessary?
-        @todo read_times for each attribute should be quantified and substracted from next polling_cycle waits. It would require adding some thread-safe methods to ThreadDict to be able to modify timewait values.
-        """
-        tdev = device in devs_dict and devs_dict[device] or device in bads_dict and bads_dict[device] or None
-        poll_cycle_ms = (poll_cycle/1e3)
-        now = time.time()
-        #Device is not read until next_update is scheduled
-        if now < tdev.next_update: 
-            self.info('%s.%s will not be read until %s' % (device,attribute,time.ctime(tdev.next_update)))
-            return tdev
-        
-        timeout = float(poll_cycle)/len(devs_dict if device in devs_dict else bads_dict if device in bads_dict else [1])
-        if tdev:
-            #tdev.lock.acquire()
-            proxy = tdev.proxy
-            #tdev.lock.release()
-            try:
-                proxy.set_timeout_millis(100)
-                proxy.ping()
+    def updateSubComposers(self):
+        #Updating _locals dictionary
+        if hasattr(self,'SubComposers') and self.SubComposers:
+            for composer in sorted(self.SubComposers):
+                self.debug('Importing states from composer: %s ' % (composer))
+                devs = self.getXAttr(composer+'/DevicesList')
+                states = self.getXAttr(composer+'/StatesList')
                 try:
-                    proxy.set_timeout_millis(int(timeout if now-tdev.last_success<3.*poll_cycle_ms else 3000))
-                    old_state = tdev.State
-                    tdev.State = proxy.state()
-                    if tdev.State!=old_state:
-                        self.info('%s State Changed! %s -> %s' % (device,old_state,tdev.State))
-                    #if attribute.lower() != 'state':
-                        #value = proxy.read_attribute(attribute).value
-                    tdev.last_success = now
-                    tdev.next_update = now + poll_cycle_ms
-                    self.info('%s next update at %s + %s' % (device,time.ctime(now),poll_cycle_ms))
-                    return tdev
-                except Exception,e: #except PyTango.CommunicationFailed,e:
-                    #state() failed ... something happenz with this device
-                    self.error("%s exception in PyStateComposer.read_remote_attribute(%s,%s): %s" % (type(e),device,attribute,traceback.format_exc()))
-                    tdev.next_update = now + 3.*poll_cycle_ms
-                    return tdev
-            except Exception,e: 
-                #ping() failed ... probably the device is not running
-                self.error("%s exception in PyStateComposer.read_remote_attribute(%s,%s).ping(): %s" % (type(e),device,attribute,traceback.format_exc()))
-                tdev.State = PyTango.DevState.UNKNOWN
-                tdev.next_update = now + 5.*poll_cycle_ms
-                return tdev
-
+                    self.SubComposers[composer].update(zip(devs,states))
+                    [(self._locals['DEVICES'].append(k),self._locals['STATES'].append(v)) for k,v in sorted(zip(devs,states))]
+                except:
+                    self.error('Unable to import states from %s:\ndevs:%s\nstates:%s\n%s' % (composer,str(devs),str(states),traceback.format_exc()))
+        return
+                        
     def evaluateStates(self):
         '''
         This method is called from push_event, always_executed_hook, AddDeviceToList and RemoveDevice methods; It depends of UseEvents property.
         
-        It iterates over DevicesList/StatesList dictionary and:
+        It iterates over DevicesDict/StatesList dictionary and:
         
         @li Chooses the highest priority in StatesList
         @li Makes a report with the epochs received for each dev in EventsList
         @li Makes a report with subscribed AttributesList
         @li Updates status and state and forces a push_change_event('state') 
         '''
-        self.debug('In evaluateStates() ...')
+        self.debug('In evaluateStates(UseEvents=%s) ...'%self.UseEvents)
         now = time.time()
+        self.LastStateCheck = now
+        old_state = self.get_state()
         try:
-            status = 'DevicesList:\n'
-            old_state = self.get_state()
-            # DevicesList is the list of devices
-            # StatesList is a dictionary with Device:State pairs
-            if self.UseEvents:
-                #@todo It should be verified that this composer is subscribed to callbacks.StatesList devices
-                StatesList = callbacks.StatesList.items() 
-            else:
-                StatesList = dict((k,d.State) for k,d in self.DevicesList.items())
-            
             #publishing Devices and States for Dynamic Attributes and States
-            if not hasattr(self,'_locals'): setattr(self,'_locals',{})
-            self._locals['DEVICES']=StatesList.keys()
-            self._locals['STATES']=StatesList.values()
+            self._locals['DEVICES'] = CaselessList(sorted(self.DevicesDict.keys()))
+            self._locals['STATES'] = [self.DevicesDict[k] for k in self._locals['DEVICES']]
+            self._locals['IGNORED'] = []
             
-            if not StatesList:
+            if not self.DevicesDict:
+                self.warning('DevicesDict is empty!')
                 self.set_state(PyTango.DevState.UNKNOWN)
                 return
-            result = StatesList.values()[0] #Initialized to first State
             
-            for dev,state in StatesList.iteritems():
-                #if self.get_name() not in e.receivers: 
-                    #print 'in ',self.get_name(),'.evaluateStates(): called for other device?!'
-                    #continue
-                if self.StatePriorities[self.TangoStates[int(state)]]>self.StatePriorities[self.TangoStates[int(result)]]:
-                    self.debug('evaluating %s; Priority of %s,%s is higher than %s,%s; STATE CHANGES!'%(dev,self.TangoStates[state],state,self.TangoStates[result],result))
-                    result=state
-                status = status + dev + ':\t' + self.TangoStates[state]
-                
-                #@todo Status must be complemented with event-related information
-                ##Getting When this value was updated for the last time
-                #if EventsList[dev.lower()+'/state'].attr_value is not None:
-                    #status = status +  '\t' + time.ctime(EventsList[dev.lower()+'/state'].attr_value.time.tv_sec)
-                ##Getting something cryptic
-                #if dev.lower() in callbacks.AttributesList.keys():
-                    #status = status +  '\t' + str(callbacks.AttributesList[dev.lower()])
-                    
-                status = status + '\n'
-                
-            if result != old_state:
+            #Discarding devices in IgnoreList property
+            self.IgnoreList = [a for a in self.IgnoreList if a.strip() and not a.startswith('#')]
+            states = []
+            for k,v in self.DevicesDict.items():
+                if not fun.matchAny(self.IgnoreList,k): states.append(v)
+                else: self._locals['IGNORED'].append(k)
+            
+            # To sort the values we use the priority for each state; obtained using the state name from self.TangoStates
+            # The highest priority (last) will give the new_state
+            if states:
+                new_state = sorted(states,key=lambda st:self.StatePriorities[str(st)])[-1]
+            else:
+                self.warning('StatesList is empty!?!?!')
+                new_state = PyTango.DevState.UNKNOWN
+            
+            if new_state != old_state:
                 #@todo Some Hystheresis or change conditions must be applied before changing the State @n (e.g. keeping FAULT at least for 5 State evaluations, waiting 3 cycles before setting an UNKNOWN state)
-                self.info('State changed! %s -> %s' % (old_state,result))
-                self.set_state(result)
-                self.push_change_event('state')
-                
-            status = 'The PyStateComposer is in ' + self.TangoStates[self.get_state()] + ' State.\n' + status
-            if not self.UseEvents: 
-                status += '\nPollingThread Info:\n'
-                status += 'timewait is %s ms\n' % (1000.*self.DevicesList.get_timewait())                
-                status += 'last update at %s\n' % time.ctime(self.DevicesList.get_last_update())
-            self.set_status(status)
+                self.info('State changed! %s -> %s' % (old_state,new_state))
+                self.set_state(new_state)
+                self.LastStateUpdate = time.time()
+                self.push_change_event('state')                    
+            
+            result = '%s = %s\n' % (str(new_state),'+'.join(set('%s(%d)'%(s,self.StatePriorities.get(str(s),0)) for s in states)))
+            status = '%s is in %s State since %s.\n'%(self.get_name(),self.get_state(),time.ctime(self.LastStateUpdate))
+            status += 'DevicesList:\n'
+            for dev,state in sorted(self.DevicesDict.items()):
+                status += dev + ':\t' + str(state) + '\n'
+            status = result+status+'\nLast Changes:\n'
+            for d,h in self.History: status+='%s: %s'%(time.ctime(d),h)
+            if not self.History or result!=self.History[0][1]: self.History.insert(0,(time.time(),result))
+            self.History = self.History[:5]
+            status+="\n\nLast event received at %s"%time.ctime(self.last_event_received)
+            #Initializes local variables needed by DynamicStatus generation in DynamicDS.always_executed_hook
+            if not self.DynamicStatus: self.set_status(status) 
+            else: self._locals['STATUS'] = status
+            self.debug('evaluateStates(): composer status = %s'%status)
             
         except Exception,e:
             self.error('Exception in evaluateStates(): %s' % traceback.format_exc())
+         
+        t3=time.time()
+        self.debug('Out of evaluateStates() ... it took %f ms' % (1000.*(t3-now)))
+
             
-        self.debug('Out of evaluateStates() ... it took %f ms' % (1000.*(time.time()-now)))
-
-    def push_event(self,event):
-        """ This method is executed each time a new event is received by the composer
-        params[in] event : allows to extract all the information relative to the event produced.
-
-        @par If UseEvents set to True:
-        @li push_event method is also called from the GlobalCallback object; 
-        @li GlobalCallback is a singletone instance of callbacks.EventCallback class;  
-        @li GlobalCallback distributes each event to its EventsList[AttributeName].receivers
-        """
-        try:
-            self.debug("In push_event(%s,%s)" % (event.device,event.attr_name))
-            device,attr_name = event.device.lower(),event.attr_name.lower()
-            value = event.attr_value.value if hasattr(event.attr_value,'value') else None
-            isState = attr_name.endswith('/state')
-            if not event.err and value is not None:
-                self.debug("Event: %s,%s = %s" % (device,attr_name,value))
-            else:
-                self.warning("Received an Error Event!: %s" % event.errors)
-
-            if self.UseEvents:
-                callbacks.EventsList[attr_name].set(event)
-                if isState: callbacks.StatesList[device] = value if not event.err else PyTango.DevState.UNKNOWN
-                else: callbacks.AttributesList[device] = value
-            elif device in self.DevicesList:
-                self.DevicesList[device].last_event = event
-                if isState: self.DevicesList[device].State = value
-
-            self.evaluateStates()
-        except Exception,e:
-            self.error("Exception in push_event(): %" % traceback.format_exc())
+    def create_state_attribute(self,argin):
+        new_attr_name = argin.upper().replace('/','_')
+        self.info('Creating attribute %s for %s/State' % (argin,new_attr_name))
+        self.add_attribute(PyTango.Attr(new_attr_name,PyTango.ArgType.DevState,PyTango.AttrWriteType.READ),
+                lambda s,attr,attr_name=argin: attr.set_value(s.DevicesDict[(fun.isSequence(attr_name) and attr_name and attr_name[0]) or attr_name]),
+                None, #self.write_new_attribute #(attr)
+                lambda s,req_type,attr_name=argin: True,#attr_name in s.DevicesDict,
+                )        
 
     def AddDeviceToList(self,argin):
         ''' @brief This method adds a new device to @bPyTango_utils.callback@b dictionaries: StatesList, EventsList, AttributesLIst ...
         @param[in] argin : the device to add; it must be an string; it can contain '*' or '?' , but not regular expressions
         
         Behaviour:
-        @li the composer and the device are both added to DevicesList (but composer itself cannot be added as device)
+        @li the composer and the device are both added to DevicesDict (but composer itself cannot be added as device)
         @li A DeviceProxy is created for the device
         @li If needed: StatesList[dev_name] and AttributesList[dev_name] are initialized to UNKNOWN and None
         @li For State and each value in AttributesList keys it checks if appears in the list of attributes of the device
@@ -333,178 +258,131 @@ class PyStateComposer(PyTango.Device_3Impl):
         self.info("In AddDeviceToList(%s) ..." % str(argin))
         try:
             if '*' in argin or '?' in argin:
-                devs = PyTango.Database().get_device_exported(argin)
+                devs = get_matching_devices(argin)
                 self.info('AddDeviceToList: %d devices got from Database using wildcard (%s)'%(len(devs),argin))
                 for d in devs:
                     self.AddDeviceToList(d)
             else:
+                argin = fun.isSequence(argin) and argin and argin[0] or argin
                 dev_name = argin.lower()
                 if dev_name==self.get_name().lower():
-                    self.warning("In AddDevice(): This device doesn't allow recursive composing.")
+                    self.warning("In AddDevice(%s): PyStateComposer doesn't allow recursive composing."%dev_name)
+                    return False
                 else:
                     try:
-                        #@todo devslist.DevicesList will keep information about all internal devices allocated or used inside a DeviceServer; composer and device must be added to that list
-                        #@todo IT SHOULD BE CHECKED THAT A DEVICE PROXY DOESN'T EXIST BEFORE CREATING A NEW ONE!!!
-                        dev = PyTango.DeviceProxy(argin)
-                        try:
-                            dev.ping()
-                            #@todo Check for DynamicAttributes!     
-                            #att = PyTango.AttributeProxy(att_name)                    
-                            attrs = [ 'State' ] #+ callbacks.AttributesList #Be careful self.AttributesList != callbacks.AttributesList #... What are the values of this list!? ... names of devices!?!?!
-                            if not self.UseEvents:
-                                self.DevicesList[argin].lock.acquire()
-                                self.DevicesList[argin].proxy = dev
-                                self.DevicesList[argin].lock.release()
-                                self.DevicesList.append(argin)                                
-                            else:
-                                # Initializing lists
-                                if dev_name not in callbacks.StatesList: callbacks.StatesList[dev_name] = PyTango.DevState.UNKNOWN
-                                if dev_name not in callbacks.AttributesList: callbacks.AttributesList[dev_name] = None
-                                
-                                for att in attrs:
-                                    att_name = (dev_name+'/'+att).lower()
-                                    if att not in dev.get_attribute_list():
-                                        continue
-                                    if not dev.is_attribute_polled(att) and self.ForcePolling:
-                                        self.info('::AddDevice(): forcing %s polling to %s' % (att,argin))
-                                        period = dev.get_attribute_poll_period(att) or 3000
-                                        dev.poll_attribute(att,period)
-                                        self.debug("%s.poll_attribute(%s,%s)" % (argin,att,period))
-                                    #cb = self 
-                                    cb = GlobalCallback
-                                    
-                                    if not att_name in callbacks.EventsList.keys():
-                                        callbacks.EventsList[att_name] = self.TAttr(att_name)
-                                        callbacks.EventsList[att_name].receivers.append(self.get_name())
-                                        self.info('AddDevice: subscribing event for %s'  % att_name)
-                                        event_id = dev.subscribe_event(att,PyTango.EventType.CHANGE,cb,[],True)
-                                        # Global List
-                                        callbacks.EventsList[att_name].dp = dev
-                                        callbacks.EventsList[att_name].event_id = event_id
-                                        callbacks.EventsList[att_name].dev_name = dev_name
-                                        print "In ", self.get_name(), "::AddDevice()", ": Listing Device/Attributes in EventsList:"
-                                        for a,t in callbacks.EventsList.items(): print "\tAttribute: ",a,"\tDevice: ",t.dev_name,"\n"
-                                    else:
-                                        self.warning("::AddDevice(%s): This attribute is already in the list, adding composer to receivers list." % att_name)
-                                        if not dev_name in callbacks.EventsList[att_name].receivers:
-                                            callbacks.EventsList[att_name].receivers.append(self.get_name())
-                                        if callbacks.EventsList[att_name].attr_value is not None:
-                                            if att is 'State':
-                                                callbacks.StatesList[dev_name]=EventsList[att_name].attr_value.value
-                                            else: 
-                                                callbacks.AttributesList[dev_name]=EventsList[att_name].attr_value.value
-                        except:
-                            self.error('%s.ping() or attribute registering failed!!!' % dev.get_name())                                            
+                        self.DevicesDict[dev_name] = PyTango.DevState.INIT
+                        self.subscribe_external_attributes(dev_name,['State'])
+                        self.create_state_attribute(argin)
+                        return True
                     except:
-                        self.error('Unable to create a DeviceProxy for %s' % argin)
-                        
-                    self.debug('listOfDevices(): %s' % str(self.get_subscribed_devices()))
-                    self.evaluateStates()
+                        self.error('Unable to subscribe to %s: %s' % (argin,traceback.format_exc()))
+        
         except Exception,e:
                 self.error('Exception in AddDevice(): %s' % traceback.format_exc())
-
 
 #------------------------------------------------------------------
 #    Device constructor
 #------------------------------------------------------------------
     def __init__(self,cl, name):
-        self.call__init__(DynamicDS,cl,name,_locals={},useDynStates=True)
-        self.call__init__(PyTango.Device_3Impl,cl,name)
+        self.call__init__(DynamicDS,cl,name,
+            _locals={
+                #'list': fun.toList,
+                'join': fun.join,
+                },
+            useDynStates=True)
+        self.__initialized = False
         PyStateComposer.init_device(self)
 
 #------------------------------------------------------------------
 #    Device destructor
 #------------------------------------------------------------------
     def delete_device(self):
-        self.info("[Device delete_device method] for device")
-        self.DevicesList.stop()
-        #if self.UseEvents:
-            #for e,t in callbacks.EventsList.items():
-                #t.dp.unsubscribe_event(t.event_id)
-                #del EventsList[e]
-                ##me = self.get_name()
-                ##if me in t.receivers:
-
+        if hasattr(self,'add_thread') and self.add_thread.is_alive():
+          self.add_event.set()
+          self.add_thread.join()
+        self.info('*'*80)
+        self.info("[Device delete_device method] for device %s"%self.get_name())
+        #self.unsubscribe_external_attributes()
+        self.info('*'*80)
 
 #------------------------------------------------------------------
 #    Device initialization
 #------------------------------------------------------------------
     def init_device(self):
         print "In ", self.get_name(), "::init_device()"
-        #print 'Members are : ','\n'.join(str(d) for d in dir(self))
-        #multia = self.get_device_attr()
-        #print str(dir(multia))
-        #print str(dir(multia.get_attr_by_name('StateAttribute')))
-        #print str(self.get_device_class().attr_list)
+        self._db = getattr(self,'_db',PyTango.Database())
         
-        self.set_state(PyTango.DevState.UNKNOWN)
-        self.get_device_properties(self.get_device_class())
-        self.setLogLevel(self.LogLevel if hasattr(self,'LogLevel') else 'DEBUG')
+        #Order Matters!
+        #self.get_device_properties(self.get_device_class())
+        self.get_DynDS_properties() #LogLevel is already set here
+        
+        #self.setLogLevel(self.LogLevel if hasattr(self,'LogLevel') else 'INFO')
+        self.set_state(PyTango.DevState.INIT)
+        self.set_status('Connecting devices ...')
         
         # If self.DevicesList property is not initialized then DeviceNameList is read instead; this is for Soleil's device compatibility
-        props = PyTango.Database().get_device_property(self.get_name(),['DeviceNameList','DevicesList'])
-        if not props['DevicesList']:
-            self.DevicesList = PyTango.Database().get_device_property(self.get_name(),['DeviceNameList'])['DeviceNameList']
+        if not self.DevicesList:
+            props = self._db.get_device_property(self.get_name(),['DeviceNameList','DevicesList'])
+            if not props['DevicesList']: self.DevicesList = props['DeviceNameList']
         self.DeviceNameList = self.DevicesList
+        self.IgnoreList = [a for a in self.IgnoreList if a.strip() and not a.startswith('#')]
         
-        self.StatePriorities = { 
-            'ON':0, 
-            'OFF':11, 
-            'CLOSE':10, 
-            'OPEN':0, 
-            'INSERT':10, 
-            'EXTRACT':0, 
-            'MOVING':8, 
-            'STANDBY':0, 
-            'FAULT':14, 
-            'INIT':13, 
-            'RUNNING':8, 
-            'ALARM':13, 
-            'DISABLE':11, 
-            'UNKNOWN':12 
-            }
-        
-        #@todo srubio: PyStateManager disabled! whole concept must be redefined or deprecated @n
-        #This dict will keep the names and states of devices       
-        self.DevicesList = DefaultThreadDict( 
-            default_factory = lambda k: TDev(k), 
-            timewait=.001*(self.PollingCycle/(1+len(self.DeviceNameList) or 1))
-            )
-        self.DevicesList.read_method = partial(self.read_remote_attribute,**{
-            'devs_dict':self.DevicesList,
-            'attribute':'state',
-            'poll_cycle':self.PollingCycle,
-            })
-        #self.DevicesList.trace = True
-        [self.AddDeviceToList(device) for device in self.DeviceNameList]
-        
-        #Enabling/Disabling EventsCallback
-        if not hasattr(self,'UseEvents'): 
-            self.UseEvents = False
-        else: self.debug('UseEvents(%s) == %s' % (type(self.UseEvents),self.UseEvents))
-        if self.UseEvents:
-            from PyTango_utils import callbacks,devslist
-        self.warning('Event Management has been %s.' % (self.UseEvents and 'ENABLED' or 'DISABLED'))
+        self.DevicesDict = fandango.CaselessDict()
+        self.AttributeCache = fandango.CaselessDict()
+        self.History = []
         
         #Updating StatePriorities dictionary
         self.UpdateStatePolicy(read_properties = False)
         
         self.info('Updating Device Properties ...')
-        default_props = { \
-            'UseEvents':[str(self.UseEvents)], \
-            'AlwaysExecutedHook': hasattr(self,'AlwaysExecutedHook') and self.AlwaysExecutedHook or [], \
-            'PollingCycle':[self.PollingCycle], \
+        default_props = {
+            'UseEvents':self.UseEvents,
+            'PollingCycle':[self.PollingCycle],
             } 
-        if not self.DynamicStates: default_props['StatePolicy']=self.StatePolicy
-        if not props['DevicesList']: default_props['DeviceNameList']=self.DeviceNameList
+        if not len(self.DynamicStates): default_props['StatePolicy']=self.StatePolicy
+        if not self.DevicesList: default_props['DeviceNameList']=self.DeviceNameList
+        if not len(self.IgnoreList): default_props['IgnoreList']=['']
         
-        PyTango.Database().put_device_property(self.get_name(),default_props)
+        self._db.put_device_property(self.get_name(),dict((k,v if fun.isSequence(v) else [v]) for k,v in default_props.items()))
+        self.info('DevicesList:%s'%self.DevicesList)
+        self.info('IgnoreList:%s'%self.IgnoreList)
+        
+        self.LastStateCheck = 0.
+        self.LastStateUpdate = 0.
+        self.last_event_received = 0.
+        self.set_change_event('State',True,True)
 
-        if self.UseEvents:
-            self.set_change_event('State',True,True)
-            
-        self.DevicesList.start()
-        self.info('Ready to accept request ...')
+        self.add_event = threading.Event()
+        def add_all(obj=self,wait=True):
+          while wait and not obj.__initialized: 
+            obj.add_event.wait(.1)
+          if obj.SubComposers:
+            obj.SubComposers = [s for s in obj.SubComposers if s]
+            print 'Adding devices from SubComposers list (%s)'%obj.SubComposers
+            obj.SubComposers = dict.fromkeys(obj.SubComposers)
+            for composer in obj.SubComposers:
+                print 'Adding devices from %s'%composer
+                if obj.add_event.is_set(): break
+                obj.SubComposers[composer] = {}
+                obj.AddDeviceToList(composer)
+                if wait: obj.add_event.wait(.1)
+	  print 'Adding devices from DevicesList'
+          for device in obj.DevicesList:
+            if obj.add_event.is_set(): break
+            obj.AddDeviceToList(device)
+            if wait: obj.add_event.wait(.1)
+          print('Ready to process events ...')
+          return
+        if False:
+          self.add_thread = threading.Thread(target=add_all)
+          self.add_thread.setDaemon(False)#True)
+          self.add_thread.start()
+        else: add_all(wait=False)
+
+        print('#'*80)        
+        print('Ready to accept request ...')
+        print('#'*80)        
+        self.__initialized = True
 
 #------------------------------------------------------------------
 #    Always excuted hook method
@@ -512,22 +390,12 @@ class PyStateComposer(PyTango.Device_3Impl):
     def always_executed_hook(self):
         #print "In ", self.get_name(), "::always_executed_hook()"
         self.debug("In ::always_executed_hook()")
-            
-        #This lines allow to use the AlwaysExecutedHook property to add custom code to the Device
-        if hasattr(self,'AlwaysExecutedHook') and self.AlwaysExecutedHook:
-            code = ''
-            for l in self.AlwaysExecutedHook:
-                code = code+l+'\n'
-            try:
-                exec code
-            except Exception,e:
-                self.error('Exception in Custom AlwaysExecutedHook: %s' % traceback.format_exc())
-
-        if not self.UseEvents:
-            self.evaluateStates() #It must be called always before DynamicDS always_executed_hook
-        
         DynamicDS.always_executed_hook(self)
-
+        if (self.LastStateCheck+5e-3*self.PollingCycle)<time.time():
+            self.evaluateStates()
+        else:
+            self._locals['DEVICES'] = CaselessList(sorted(self.DevicesDict.keys()))
+            self._locals['STATES'] = [self.DevicesDict[k] for k in self._locals['DEVICES']]
 
 #==================================================================
 #
@@ -541,8 +409,6 @@ class PyStateComposer(PyTango.Device_3Impl):
         #print "In ", self.get_name(), "::read_attr_hardware()"
         self.debug("In read_attr_hardware()")
 
-
-
 #------------------------------------------------------------------
 #    Read StatesList attribute
 #------------------------------------------------------------------
@@ -553,10 +419,9 @@ class PyStateComposer(PyTango.Device_3Impl):
         #    Add your own code here
         
         attr_StatesList_read = []
-        if self.UseEvents:
-            for v in callbacks.StatesList.values(): attr_StatesList_read.append(str(v))
-        else:
-            [attr_StatesList_read.append(v.State) for v in self.DevicesList.values()]
+        [attr_StatesList_read.append(str(v)) for k,v in sorted(self.DevicesDict.items())]
+        if self.SubComposers:
+            [[attr_StatesList_read.append(v) for k,v in sorted(self.SubComposers[c].items())] for c in sorted(self.SubComposers)]
         attr.set_value(attr_StatesList_read, len(attr_StatesList_read))
 
 
@@ -570,12 +435,26 @@ class PyStateComposer(PyTango.Device_3Impl):
         #    Add your own code here
         
         attr_DevicesList_read = []
-        if self.UseEvents:
-            for d in callbacks.StatesList.keys(): attr_DevicesList_read.append(d)
-        else:
-            [attr_DevicesList_read.append(d) for d in self.DevicesList]
+        [attr_DevicesList_read.append(k) for k,v in sorted(self.DevicesDict.items())]
+        if hasattr(self,'SubComposers') and self.SubComposers:
+            [[attr_DevicesList_read.append(k) for k,v in sorted(self.SubComposers[c].items())] for c in sorted(self.SubComposers)] 
         attr.set_value(attr_DevicesList_read, len(attr_DevicesList_read))
 
+#------------------------------------------------------------------
+#    Read DevStates attribute
+#------------------------------------------------------------------
+    def read_DevStates(self, attr):
+        #print "In ", self.get_name(), "::read_DevStates"
+        self.debug("In read_DevStates")
+        
+        #    Add your own code here
+        attr_DevStates_read = []
+        if hasattr(self,'_locals'):
+            devs,states = self._locals['DEVICES'],self._locals['STATES']
+            for d,s in zip(devs,states):
+                attr_DevStates_read.append(str(d))
+                attr_DevStates_read.append(str(s))
+        attr.set_value(attr_DevStates_read, len(attr_DevStates_read))
 
 
 #==================================================================
@@ -640,23 +519,26 @@ class PyStateComposer(PyTango.Device_3Impl):
         
         #Updating Device Properties
         if read_properties: self.get_device_properties(self.get_device_class())
-        #Updating StatePriorites dictionaty from StatePolicy property
+        #Updating StatePriorites dictionary from StatePolicy property
         if len(self.StatePolicy):
+            self.StatePriorities = {}
             separators = ":=, "
-            tokens=[]
             for line in self.StatePolicy:
-                for s in separators:
-                    part=line.split(str(s))
-                    if len(part)<2: 
-                        continue
-                    if part[1]!=None:
-                        self.StatePriorities[part[0]]=part[1]
-                        break
+                try:
+                    line = line.strip().split('#')[0]
+                    if not line: continue
+                    state,priority = fun.first(line.split(s) for s in separators if s in line)
+                    self.StatePriorities[state.upper()]=int(priority)
+                except:
+                    self.error('Exception in UpdateStatePolicy():\n%s'%traceback.format_exc())
+            [self.StatePriorities.__setitem__(s,0) for s in self.TangoStates if s not in self.StatePriorities]
+        else:
+            self.info("Reloading default StatePolicy")
+            self.StatePriorities = dict(PyStateComposer.defaultStatePriorities)
+            
         #Updating StatePolicy from StateProperties dictionary
-        self.StatePolicy = []
-        for i in range(len(self.StatePriorities)):
-            k = self.StatePriorities.keys()[i]
-            self.StatePolicy.append(str(k)+","+str(self.StatePriorities[k]))    
+        self.StatePolicy = ['%s,%d'%(k,v) for v,k in sorted((j,s) for s,j in self.StatePriorities.items())]
+        if read_properties: get_database().put_device_property(self.get_name(),{'StatePolicy':self.StatePolicy})
         self.info('StatePolicy set to: %s' % str(self.StatePolicy))
         return
 
@@ -666,7 +548,7 @@ class PyStateComposer(PyTango.Device_3Impl):
 #    PyStateComposerClass class definition
 #
 #==================================================================
-class PyStateComposerClass(PyTango.PyDeviceClass):
+class PyStateComposerClass(PyTango.DeviceClass):
 
     #    Class Properties
     class_property_list = {
@@ -677,27 +559,43 @@ class PyStateComposerClass(PyTango.PyDeviceClass):
     device_property_list = {
         'DynamicAttributes':
             [PyTango.DevVarStringArray,
-            "Attributes and formulas to create for this device.<br>This Tango Attributes will be generated dynamically using this syntax:<br>&nbsp;AllPressures=DevVarLongArray([XAttr(dev+'/Pressure') or 0 for dev in DEVICES])",
+            "Attributes and formulas to create for this device.<br>This Tango Attributes will be generated dynamically using this syntax:<br>&nbsp;AllPressures=DevVarDoubleArray([XAttr(dev+'/Pressure') or 0 for dev in DEVICES])",
             [] ],
         'DynamicStates':
             [PyTango.DevVarStringArray,
             "This property will allow to declare new States dinamically based on dynamic attributes changes:<br>&nbsp;FAULT=any([s==FAULT for s in STATES])<br>&nbsp;ON=1",
             [] ],
+        'CheckDependencies':
+            [PyTango.DevBoolean,
+            "This property manages if dependencies between attributes are used to check readability.",
+            [False] ], #This property is normally True for other Dynamic Devices
         'PollingCycle':
             [PyTango.DevLong,
             "Default period for polling all device states.",
             [ 3000 ] ],
         'UseEvents':
-            [PyTango.DevBoolean,
+            [PyTango.DevVarStringArray,
             "This property allows to enable/disable events management.",
-            [ False ] ],
+            [ 'false' ] ],
         'DevicesList':
             [PyTango.DevVarStringArray,
             "A list of device names, wildcards like domain/family/* are allowed.<br>If this property is not initialized DeviceNameList is read instead.",
             [] ],
+        'IgnoreList':
+            [PyTango.DevVarStringArray,
+            "A list of device names, wildcards like domain/family/* are allowed.<br>The devices in this list will not be used to compose the state.",
+            [] ],    
+        'SubComposers':
+            [PyTango.DevVarStringArray,
+            "A list of composer device names from which devices/states lists will be imported.",
+            [] ],            
         'StatePolicy':
             [PyTango.DevVarStringArray,
             "A list of States and its priority. this property is not used if DynamicStates has been initialized.",
+            [] ],
+        'DynamicStatus':
+            [PyTango.DevVarStringArray,
+            "Each line generated by this property code will be added to status",
             [] ],
         }
 
@@ -707,9 +605,9 @@ class PyStateComposerClass(PyTango.PyDeviceClass):
         'AddDevice':
             [[PyTango.DevString, "Device to add to the composing"],
             [PyTango.DevVoid, ""]],
-        'RemoveDevice':
-            [[PyTango.DevString, "Device to remove"],
-            [PyTango.DevVoid, ""]],
+        #'RemoveDevice':
+            #[[PyTango.DevString, "Device to remove"],
+            #[PyTango.DevVoid, ""]],
         'UpdateStatePolicy':
             [[PyTango.DevVoid, "Reloads StatePolicy from the database"],
             [PyTango.DevVoid, ""]],
@@ -721,17 +619,24 @@ class PyStateComposerClass(PyTango.PyDeviceClass):
         'StatesList':
             [[PyTango.DevString,
             PyTango.SPECTRUM,
-            PyTango.READ, 256],
+            PyTango.READ, 2048],
             {
                 'description':"States of subscribed devices.",
             } ],
         'DevicesList':
             [[PyTango.DevString,
             PyTango.SPECTRUM,
-            PyTango.READ, 256],
+            PyTango.READ, 2048],
             {
                 'description':"Devices actually subscribed.",
             } ],
+        'DevStates':
+            [[PyTango.DevString,
+            PyTango.SPECTRUM,
+            PyTango.READ, 2048],
+            {
+                'description':"A list with device/state pairs .",
+            } ],            
         }
 
 
@@ -739,7 +644,7 @@ class PyStateComposerClass(PyTango.PyDeviceClass):
 #    PyStateComposerClass Constructor
 #------------------------------------------------------------------
     def __init__(self, name):
-        PyTango.PyDeviceClass.__init__(self, name)
+        PyTango.DeviceClass.__init__(self, name)
         self.set_type(name);
         print "In PyStateComposerClass  constructor"
 
@@ -750,11 +655,13 @@ class PyStateComposerClass(PyTango.PyDeviceClass):
 #==================================================================
 if __name__ == '__main__':
     try:
-        py = PyTango.PyUtil(sys.argv)
+        py = ('PyUtil' in dir(PyTango) and PyTango.PyUtil or PyTango.Util)(sys.argv)
         PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
+        PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,Dev4Tango,PyTango.DeviceClass,ForceDevImpl=False)
         py.add_TgClass(PyStateComposerClass,PyStateComposer,'PyStateComposer')
 
         U = PyTango.Util.instance()
+        CreateDynamicCommands(PyStateComposer,PyStateComposerClass)
         U.server_init()
         U.server_run()
 
@@ -762,5 +669,7 @@ if __name__ == '__main__':
         print '-------> Received a DevFailed exception:',e
     except Exception,e:
         print '-------> An unforeseen exception occured....',e
+else:
+    PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
+    PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,Dev4Tango,PyTango.DeviceClass,ForceDevImpl=False)
 
-PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
