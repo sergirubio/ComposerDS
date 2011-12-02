@@ -1,5 +1,5 @@
 #    "$Name: not supported by cvs2svn $";
-#    "$Header: /users/chaize/newsvn/cvsroot/Calculation/PyStateComposer/src/PyStateComposer.py,v 1.4 2011-11-30 16:04:34 sergi_rubio Exp $";
+#    "$Header: /users/chaize/newsvn/cvsroot/Calculation/PyStateComposer/src/PyStateComposer.py,v 1.5 2011-12-02 12:58:27 sergi_rubio Exp $";
 #=============================================================================
 #
 # file :        PyStateComposer.py
@@ -14,13 +14,13 @@
 #
 # $Author: sergi_rubio $
 #
-# $Revision: 1.4 $
+# $Revision: 1.5 $
 #
 # $Log: not supported by cvs2svn $
 # Revision 1.2  2009/01/22 16:37:41  sergi_rubio
 # Now this PyStateComposer uses Miscellaneous/PyTango_utils package. It provides DynamicDS and ThreadDict for DynamicAttributes and reliable polling.
 #
-# $Revision: 1.4 $
+# $Revision: 1.5 $
 #
 # Revision 1.1.1.1  2007/10/17 16:42:52  sergi_rubio
 # A PyTango StateComposer, based on Calculation/StateComposer device
@@ -178,7 +178,8 @@ class PyStateComposer(PyTango.Device_4Impl):
         old_state = self.get_state()
         try:
             #publishing Devices and States for Dynamic Attributes and States
-            self._locals['DEVICES'] = CaselessList(sorted(self.DevicesDict.keys()))
+            self._locals['DEVICES'] = CaselessList(self.DevicesDict.keys())
+            if self.SortLists: self._locals['DEVICES'] = sorted(self._locals['DEVICES'])
             self._locals['STATES'] = [self.DevicesDict[k] for k in self._locals['DEVICES']]
             self._locals['IGNORED'] = []
             
@@ -188,11 +189,11 @@ class PyStateComposer(PyTango.Device_4Impl):
                 return
             
             #Discarding devices in IgnoreList property
-            self.IgnoreList = [a for a in self.IgnoreList if a.strip() and not a.startswith('#')]
+            self.IgnoreList = [a.lower() for a in self.IgnoreList if a.strip() and not a.startswith('#')]
             states = []
             for k,v in self.DevicesDict.items():
-                if not fun.matchAny(self.IgnoreList,k): states.append(v)
-                else: self._locals['IGNORED'].append(k)
+                if not fun.matchAny(self.IgnoreList,k.lower()): states.append(v)
+                else: self._locals['IGNORED'].append(k.lower())
             
             # To sort the values we use the priority for each state; obtained using the state name from self.TangoStates
             # The highest priority (last) will give the new_state
@@ -212,7 +213,7 @@ class PyStateComposer(PyTango.Device_4Impl):
             result = '%s = %s\n' % (str(new_state),'+'.join(set('%s(%d)'%(s,self.StatePriorities.get(str(s),0)) for s in states)))
             status = '%s is in %s State since %s.\n'%(self.get_name(),self.get_state(),time.ctime(self.LastStateUpdate))
             status += 'DevicesList:\n'
-            for dev,state in sorted(self.DevicesDict.items()):
+            for dev,state in zip(self._locals['DEVICES'],self._locals['STATES']):
                 status += dev + ':\t' + str(state) + '\n'
             status = result+status+'\nLast Changes:\n'
             for d,h in self.History: status+='%s: %s'%(time.ctime(d),h)
@@ -235,11 +236,20 @@ class PyStateComposer(PyTango.Device_4Impl):
         new_attr_name = argin.upper().replace('/','_')
         self.info('Creating attribute %s for %s/State' % (argin,new_attr_name))
         self.add_attribute(PyTango.Attr(new_attr_name,PyTango.ArgType.DevState,PyTango.AttrWriteType.READ),
-                lambda s,attr,attr_name=argin: attr.set_value(s.DevicesDict[(fun.isSequence(attr_name) and attr_name and attr_name[0]) or attr_name]),
+                self.read_state_attribute,
                 None, #self.write_new_attribute #(attr)
-                lambda s,req_type,attr_name=argin: True,#attr_name in s.DevicesDict,
-                )        
+                lambda s,req_type,attr_name=argin: True,
+                )
 
+    def read_state_attribute(self,attr,attr_name=None):
+        self.info('In read_state_attribute(%s,%s,%s)'%(self.get_name(),attr.get_name(),attr_name))
+        if attr_name is None: 
+            attr_name = [a.lower() for a in self.DevicesDict if a.replace('_','').replace('/','').lower()==attr.get_name().replace('_','').lower()]
+            if not attr_name: raise Exception('%s:AttributesNotFound!'%attr.get_name())
+        self.debug('\t%s = > %s'%(attr.get_name(),attr_name))
+        attr.set_value(self.DevicesDict[((fun.isSequence(attr_name) and attr_name and attr_name[0]) or attr_name).lower()])
+    if getattr(PyTango,'__version_number__',0)<722: read_state_attribute=staticmethod(read_state_attribute)
+    
     def AddDeviceToList(self,argin):
         ''' @brief This method adds a new device to @bPyTango_utils.callback@b dictionaries: StatesList, EventsList, AttributesLIst ...
         @param[in] argin : the device to add; it must be an string; it can contain '*' or '?' , but not regular expressions
@@ -327,7 +337,7 @@ class PyStateComposer(PyTango.Device_4Impl):
         self.DeviceNameList = self.DevicesList
         self.IgnoreList = [a for a in self.IgnoreList if a.strip() and not a.startswith('#')]
         
-        self.DevicesDict = fandango.CaselessDict()
+        self.DevicesDict = fandango.SortedDict()#fandango.CaselessDict()
         self.AttributeCache = fandango.CaselessDict()
         self.History = []
         
@@ -366,7 +376,7 @@ class PyStateComposer(PyTango.Device_4Impl):
                 obj.SubComposers[composer] = {}
                 obj.AddDeviceToList(composer)
                 if wait: obj.add_event.wait(.1)
-	  print 'Adding devices from DevicesList'
+          print 'Adding devices from DevicesList'
           for device in obj.DevicesList:
             if obj.add_event.is_set(): break
             obj.AddDeviceToList(device)
@@ -394,7 +404,8 @@ class PyStateComposer(PyTango.Device_4Impl):
         if (self.LastStateCheck+5e-3*self.PollingCycle)<time.time():
             self.evaluateStates()
         else:
-            self._locals['DEVICES'] = CaselessList(sorted(self.DevicesDict.keys()))
+            self._locals['DEVICES'] = CaselessList(self.DevicesDict.keys())
+            if self.SortLists: self._locals['DEVICES'] = sorted(self._locals['DEVICES'])
             self._locals['STATES'] = [self.DevicesDict[k] for k in self._locals['DEVICES']]
 
 #==================================================================
@@ -419,7 +430,7 @@ class PyStateComposer(PyTango.Device_4Impl):
         #    Add your own code here
         
         attr_StatesList_read = []
-        [attr_StatesList_read.append(str(v)) for k,v in sorted(self.DevicesDict.items())]
+        [attr_StatesList_read.append(str(v)) for k,v in self.DevicesDict.items()]
         if self.SubComposers:
             [[attr_StatesList_read.append(v) for k,v in sorted(self.SubComposers[c].items())] for c in sorted(self.SubComposers)]
         attr.set_value(attr_StatesList_read, len(attr_StatesList_read))
@@ -435,7 +446,8 @@ class PyStateComposer(PyTango.Device_4Impl):
         #    Add your own code here
         
         attr_DevicesList_read = []
-        [attr_DevicesList_read.append(k) for k,v in sorted(self.DevicesDict.items())]
+        [attr_DevicesList_read.append(k) for k,v in self.DevicesDict.items()]
+        if self.SortLists: attr_DevicesList_read = sorted(attr_DevicesList_read)
         if hasattr(self,'SubComposers') and self.SubComposers:
             [[attr_DevicesList_read.append(k) for k,v in sorted(self.SubComposers[c].items())] for c in sorted(self.SubComposers)] 
         attr.set_value(attr_DevicesList_read, len(attr_DevicesList_read))
@@ -565,6 +577,10 @@ class PyStateComposerClass(PyTango.DeviceClass):
             [PyTango.DevVarStringArray,
             "This property will allow to declare new States dinamically based on dynamic attributes changes:<br>&nbsp;FAULT=any([s==FAULT for s in STATES])<br>&nbsp;ON=1",
             [] ],
+        'DynamicStatus':
+            [PyTango.DevVarStringArray,
+            "Each line generated by this property code will be added to status",
+            [] ],
         'CheckDependencies':
             [PyTango.DevBoolean,
             "This property manages if dependencies between attributes are used to check readability.",
@@ -593,10 +609,10 @@ class PyStateComposerClass(PyTango.DeviceClass):
             [PyTango.DevVarStringArray,
             "A list of States and its priority. this property is not used if DynamicStates has been initialized.",
             [] ],
-        'DynamicStatus':
-            [PyTango.DevVarStringArray,
-            "Each line generated by this property code will be added to status",
-            [] ],
+        'SortLists':
+            [PyTango.DevBoolean,
+            "A property to control whether DEVICES/STATES lists will be sorted or not",
+            [True] ],
         }
 
 
