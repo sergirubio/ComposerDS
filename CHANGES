@@ -1,3 +1,31 @@
+VERSION = 6.3 - May 2014
+
+MultiHost methods from Fandango caused problems to 6.2 release
+@todo: MultiHost has been forced to False until next release
+
+6.2 - November 2013
+
+Solved bug in evaluateStates() that may have caused periodic switch to UNKNOWN state.
+With new Fandango 10.9 it provides access to other controls sytems using XATTR('host:10000/a/b/c/d')
+
+
+6.1 - October 2013
+
+Added VersionNumber attribute
+
+6.0 - August 2013
+-----------------------------
+UseTaurus property makes taurus completely optional
+EvaluateStates modified to perform dead-thread tests
+Added taurus from fandango.tango to locals; to have access to taurus.Factory() if needed
+Solved bug on error event received
+
+February 2012 5.6
+-----------------------------
+Using DynamicDS.event_received to manage incoming events
+Using read_state_attribute method instead of lambdas
+Caseless lists for all arrays
+
 December 2011 4.7
 -----------------------------
 Added SortLists property to manage how DEVICES/STATES lists are generated.

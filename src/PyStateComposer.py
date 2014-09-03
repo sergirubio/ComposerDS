@@ -1,5 +1,5 @@
-#    "$Name: not supported by cvs2svn $";
-#    "$Header: /users/chaize/newsvn/cvsroot/Calculation/PyStateComposer/src/PyStateComposer.py,v 1.5 2011-12-02 12:58:27 sergi_rubio Exp $";
+#    "$Name:  $";
+#    "$Header:  $";
 #=============================================================================
 #
 # file :        PyStateComposer.py
@@ -14,13 +14,13 @@
 #
 # $Author: sergi_rubio $
 #
-# $Revision: 1.5 $
+# $Revision: 1.2 $
 #
-# $Log: not supported by cvs2svn $
+# $Log: PyStateComposer.py,v $
 # Revision 1.2  2009/01/22 16:37:41  sergi_rubio
 # Now this PyStateComposer uses Miscellaneous/PyTango_utils package. It provides DynamicDS and ThreadDict for DynamicAttributes and reliable polling.
 #
-# $Revision: 1.5 $
+# $Revision:  $
 #
 # Revision 1.1.1.1  2007/10/17 16:42:52  sergi_rubio
 # A PyTango StateComposer, based on Calculation/StateComposer device
@@ -49,18 +49,20 @@ except: import PyTango_utils as fandango
 import fandango.functional as fun
 from fandango import DynamicDS,DynamicDSClass,DynamicAttribute
 from fandango.interface import FullTangoInheritance
-from fandango.dynamic import CreateDynamicCommands
+from fandango.dynamic import CreateDynamicCommands,USE_STATIC_METHODS
 from fandango.device import Dev4Tango,fakeEventType,get_matching_devices,get_database
+from fandango.tango import fakeAttributeValue
 
-try: from tau.core.utils.containers import CaselessList
-except:
-    try: from fandango import CaselessList
-    except: CaselessList = list
+from fandango import CaselessList
 
 if "Device_4Impl" not in dir(PyTango):
     print 'Adapting to PyTango7 ...'
     PyTango.DeviceClass = PyTango.PyDeviceClass
     PyTango.Device_4Impl = PyTango.Device_3Impl
+    
+try: __RELEASE__ = (l for l in open(os.path.dirname(os.path.abspath(__file__))+'/CHANGES').readlines() if l.startswith('VERSION')).next().split('=',1)[-1].strip()
+except Exception,e: __RELEASE__ = str(e)
+print '> ',__RELEASE__
 
 """
 @mainpage PyStateComposer Tango Device Server
@@ -113,38 +115,43 @@ class PyStateComposer(PyTango.Device_4Impl):
             'FAULT':14, 
             }
     
+    def cout(self,prio,s):
+        if self.getLogLevel(prio)>=self.log_obj.level:
+            print '%s %s %s: %s' % (prio.upper(),time.strftime('%Y-%m-%d %H:%M:%S',time.localtime()),self.get_name(),s)
+        if hasattr(self,prio): getattr(self,prio)(s)
+
     def event_received(self,source,type_,attr_value):
         """
         This method manages the events received from external attributes.
         """
-        #self.info,debug,error,warning should not be used here to avoid conflicts with tau.core logging
-        def log(prio,s,obj=self): 
-            if obj.getLogLevel(prio)>=obj.log_obj.level:
-                print '%s %s %s: %s' % (prio.upper(),time.strftime('%Y-%m-%d %H:%M:%S',time.localtime()),obj.get_name(),s)
-        log('debug','In PyStateComposer.event_received(%s(%s),%s,%s)'%(type(source).__name__,source,fakeEventType[type_],type(attr_value).__name__))
         self.last_event_received = time.time()
+        DynamicDS.event_received(self,source,type_,attr_value)
+        self.cout('info','-'*80)
+        self.cout('info','In PyStateComposer.event_received(%s(%s),%s,%s)'%(type(source).__name__,source,fakeEventType[type_],type(attr_value).__name__))
         try:
-            source = str(source).strip().lower()
-            log('debug','source = %s'%source)
+            source = fandango.tango.get_model_name(source)
+            self.cout('debug','source = %s'%source)
             if 'Config'==fakeEventType[type_]:
-                log('debug','Config event ignored ... %s'%source)
+                self.cout('debug','Config event ignored ... %s'%source)
             elif '/' not in source:
-                log('info','Not-tango names ignored ... %s'%source)
+                self.cout('info','Not-tango names ignored ... %s'%source)
             else:
-                attr_name = '/'.join(source.split('/')[-4:]) #domain/family/member/attribute
-                dev_name,att = attr_name.rsplit('/',1) if '/' in attr_name else (attr_name,attr_name)
-                if 'Error'==fakeEventType[type_]:
-                    log('error','Error received from %s: %s'%(source, attr_value))
-                    self.AttributeCache[attr_name] = None
+                params = fandango.tango.parse_tango_model(source)
+                tango_host,dev_name,att,attr_name = '%s:%s'%(params['host'],params['port']),\
+                    params['devicename'],params['attributename'],'%s/%s'%(params['devicename'],params['attributename'])
+                if 'Error'==fakeEventType[type_] or not hasattr(attr_value,'value'):
+                    self.cout('warning','%s Error received: %s'%(attr_name,attr_value))
+                    self.AttributeCache[attr_name] = fakeAttributeValue(attr_name,attr_value,time.time(),error=True)
+                    value = None
                 else:
-                    log('debug','Periodic/Change event received from %s'%attr_name)
-                self.AttributeCache[attr_name] = attr_value # I keep value/time/quality struct
-                value = getattr(attr_value,'value',None)
+                    self.AttributeCache[attr_name] = attr_value # I keep value/time/quality struct
+                    value = attr_value.value
                 if att == 'state' and (self.DevicesDict.get(dev_name)!=value or 'Error'==fakeEventType[type_]):
                     self.DevicesDict[dev_name] = fun.notNone(value,PyTango.DevState.UNKNOWN)
                     if self.__initialized: self.evaluateStates()
         except:
-            log('error','Exception in event_received(...):\n%s'%traceback.format_exc())
+            self.cout('error','Exception in event_received(...):\n%s'%traceback.format_exc())
+        self.cout('info','Out of PyStateComposer.event_received()')
         return
 
     def updateSubComposers(self):
@@ -172,10 +179,12 @@ class PyStateComposer(PyTango.Device_4Impl):
         @li Makes a report with subscribed AttributesList
         @li Updates status and state and forces a push_change_event('state') 
         '''
-        self.debug('In evaluateStates(UseEvents=%s) ...'%self.UseEvents)
+        self.cout('debug','In evaluateStates(UseEvents=%s) ...'%self.UseEvents)
+        dead_thread = 0
         now = time.time()
+        states = []
         self.LastStateCheck = now
-        old_state = self.get_state()
+        new_state = old_state = self.get_state()
         try:
             #publishing Devices and States for Dynamic Attributes and States
             self._locals['DEVICES'] = CaselessList(self.DevicesDict.keys())
@@ -184,52 +193,92 @@ class PyStateComposer(PyTango.Device_4Impl):
             self._locals['IGNORED'] = []
             
             if not self.DevicesDict:
-                self.warning('DevicesDict is empty!')
-                self.set_state(PyTango.DevState.UNKNOWN)
-                return
-            
-            #Discarding devices in IgnoreList property
-            self.IgnoreList = [a.lower() for a in self.IgnoreList if a.strip() and not a.startswith('#')]
-            states = []
-            for k,v in self.DevicesDict.items():
-                if not fun.matchAny(self.IgnoreList,k.lower()): states.append(v)
-                else: self._locals['IGNORED'].append(k.lower())
-            
-            # To sort the values we use the priority for each state; obtained using the state name from self.TangoStates
-            # The highest priority (last) will give the new_state
-            if states:
-                new_state = sorted(states,key=lambda st:self.StatePriorities[str(st)])[-1]
+                self.cout('warning','DevicesDict is empty! State (%s) will not be updated.'%old_state)
             else:
-                self.warning('StatesList is empty!?!?!')
-                new_state = PyTango.DevState.UNKNOWN
+                #Discarding devices in IgnoreList property
+                self.IgnoreList = [a.lower() for a in self.IgnoreList if a.strip() and not a.startswith('#')]
+                for k,v in self.DevicesDict.items():
+                    if not fun.matchAny(self.IgnoreList,k.lower()):
+                        states.append(v)
+                        #Checking dead_threads
+                        try:
+                            a = (k+'/state').lower()
+                            if a not in self.AttributeCache: self.AttributeCache[a] = fakeAttributeValue(a,None,0)
+                            av = self.AttributeCache[a]
+                            last = av.time.totime()
+                            if (last-now)>(0.5e-3*self.PollingCycle):
+                                print '>'*80
+                                self.cout('info','Checking untracked %s changes since %s'%(a,last))
+                                try: v = av.read(cache=False).value
+                                except: v = None
+                                if v!=av.value:
+                                    dead_thread = last
+                                    self.cout('error','*'*80)
+                                    self.cout('error','%s THREAD IS DEAD SINCE %s (%s != %s) !'%(a.upper(),time.ctime(dead_thread),av.value,v))
+                                    self.cout('error','*'*80)
+                                if not isinstance(av,fakeAttributeValue):
+                                    self.AttributeCache[a] = fakeAttributeValue(a,value,now,av.quality,av.dim_x,av.dim_y)
+                                else:
+                                    self.AttributeCache[a].set_date(now)
+                        except:
+                            #if not av:
+                                #self.warning('%s error received or not read yet!')
+                            #elif av.value not in (None,PyTango.DevState.UNKNOWN):
+                            self.cout('error','Exception in evaluateStates(%s)'%a)
+                            print traceback.format_exc()
+                    else: self._locals['IGNORED'].append(k.lower())
             
-            if new_state != old_state:
-                #@todo Some Hystheresis or change conditions must be applied before changing the State @n (e.g. keeping FAULT at least for 5 State evaluations, waiting 3 cycles before setting an UNKNOWN state)
-                self.info('State changed! %s -> %s' % (old_state,new_state))
-                self.set_state(new_state)
-                self.LastStateUpdate = time.time()
-                self.push_change_event('state')                    
-            
-            result = '%s = %s\n' % (str(new_state),'+'.join(set('%s(%d)'%(s,self.StatePriorities.get(str(s),0)) for s in states)))
-            status = '%s is in %s State since %s.\n'%(self.get_name(),self.get_state(),time.ctime(self.LastStateUpdate))
-            status += 'DevicesList:\n'
-            for dev,state in zip(self._locals['DEVICES'],self._locals['STATES']):
-                status += dev + ':\t' + str(state) + '\n'
-            status = result+status+'\nLast Changes:\n'
-            for d,h in self.History: status+='%s: %s'%(time.ctime(d),h)
-            if not self.History or result!=self.History[0][1]: self.History.insert(0,(time.time(),result))
-            self.History = self.History[:5]
-            status+="\n\nLast event received at %s"%time.ctime(self.last_event_received)
-            #Initializes local variables needed by DynamicStatus generation in DynamicDS.always_executed_hook
-            if not self.DynamicStatus: self.set_status(status) 
-            else: self._locals['STATUS'] = status
-            self.debug('evaluateStates(): composer status = %s'%status)
+            if not dead_thread:
+                # To sort the values we use the priority for each state; obtained using the state name from self.TangoStates
+                # The highest priority (last) will give the new_state
+                if states:
+                    new_state = sorted(states,key=lambda st:self.StatePriorities[str(st)])[-1]
+                elif self.DevicesDict:
+                    self.cout('warning','StatesList is empty!?!?!')
+                    new_state = PyTango.DevState.UNKNOWN
+                    
+                if self.dyn_states:
+                    result = '%s = %s\n' %(str(old_state),self.dyn_states.get(str(old_state),{}).get('formula',' ...' ))
+                    self.cout('info','DynamicStates (%s) overrides State composing.'%result)                    
+                elif states:
+                    result = '%s = %s\n' % (str(new_state),'+'.join(sorted(set('%s(%d)'%(s,self.StatePriorities.get(str(s),0)) for s in states))))
+                else:
+                    result = '%s\n'%old_state
+                    
+                if new_state != old_state:
+                    #@todo Some Hystheresis or change conditions must be applied before changing the State @n (e.g. keeping FAULT at least for 5 State evaluations, waiting 3 cycles before setting an UNKNOWN state)
+                    self.LastStateUpdate = time.time()
+                    if states: self.info(sorted(states,key=lambda st:self.StatePriorities[str(st)])[-1])
+                    if not self.dyn_states:
+                        self.cout('info','State changed! %s -> %s' % (old_state,new_state))
+                        self.set_state(new_state)
+                        self.push_change_event('state')                    
+                
+                status = '%s is in %s State since %s.\n'%(self.get_name(),self.get_state(),time.ctime(self.LastStateUpdate))
+                status += 'DevicesList:\n'
+                for dev,state in zip(self._locals['DEVICES'],self._locals['STATES']):
+                    status += dev + ':\t' + str(state) + '\n'
+                status = result+status+'\nLast Changes:\n'
+                for d,h in self.History: status+='%s: %s'%(time.ctime(d),h)
+                if not self.History or result!=self.History[0][1]: self.History.insert(0,(time.time(),result))
+                self.History = self.History[:5]
+                status+="\n\nLast event received at %s"%time.ctime(self.last_event_received)
+                #Initializes local variables needed by DynamicStatus generation in DynamicDS.always_executed_hook
+                if not self.DynamicStatus: self.set_status(status) 
+                else: self._locals['STATUS'] = status
+            else:
+                self.set_state(PyTango.DevState.FAULT)
+                self.set_status('DEAD THREAD!\nDevice should be restarted?')
+
+            self.cout('debug','evaluateStates(): composer status = %s'%status)
             
         except Exception,e:
-            self.error('Exception in evaluateStates(): %s' % traceback.format_exc())
+            msg = 'Exception in evaluateStates(): %s' % traceback.format_exc()
+            self.cout('error',msg)
+            self.set_status(msg)
          
         t3=time.time()
-        self.debug('Out of evaluateStates() ... it took %f ms' % (1000.*(t3-now)))
+        self.cout('info','Out of evaluateStates() ... it took %f ms' % (1000.*(t3-now)))
 
             
     def create_state_attribute(self,argin):
@@ -248,7 +297,7 @@ class PyStateComposer(PyTango.Device_4Impl):
             if not attr_name: raise Exception('%s:AttributesNotFound!'%attr.get_name())
         self.debug('\t%s = > %s'%(attr.get_name(),attr_name))
         attr.set_value(self.DevicesDict[((fun.isSequence(attr_name) and attr_name and attr_name[0]) or attr_name).lower()])
-    if getattr(PyTango,'__version_number__',0)<722: read_state_attribute=staticmethod(read_state_attribute)
+    if USE_STATIC_METHODS: read_state_attribute=staticmethod(read_state_attribute)
     
     def AddDeviceToList(self,argin):
         ''' @brief This method adds a new device to @bPyTango_utils.callback@b dictionaries: StatesList, EventsList, AttributesLIst ...
@@ -268,7 +317,7 @@ class PyStateComposer(PyTango.Device_4Impl):
         self.info("In AddDeviceToList(%s) ..." % str(argin))
         try:
             if '*' in argin or '?' in argin:
-                devs = get_matching_devices(argin)
+                devs = get_matching_devices(argin,fullname=False)
                 self.info('AddDeviceToList: %d devices got from Database using wildcard (%s)'%(len(devs),argin))
                 for d in devs:
                     self.AddDeviceToList(d)
@@ -298,6 +347,7 @@ class PyStateComposer(PyTango.Device_4Impl):
             _locals={
                 #'list': fun.toList,
                 'join': fun.join,
+                'taurus': fandango.tango.TAU or None,
                 },
             useDynStates=True)
         self.__initialized = False
@@ -419,6 +469,18 @@ class PyStateComposer(PyTango.Device_4Impl):
     def read_attr_hardware(self,data):
         #print "In ", self.get_name(), "::read_attr_hardware()"
         self.debug("In read_attr_hardware()")
+
+
+#------------------------------------------------------------------
+#    Read VersionNumber attribute
+#------------------------------------------------------------------
+    def read_VersionNumber(self, attr):
+        self.debug( "In "+self.get_name()+"::read_VersionNumber()")
+
+        #    Add your own code here
+        attr_VersionNumber_read = __RELEASE__
+        attr.set_value(attr_VersionNumber_read)
+
 
 #------------------------------------------------------------------
 #    Read StatesList attribute
@@ -613,6 +675,10 @@ class PyStateComposerClass(PyTango.DeviceClass):
             [PyTango.DevBoolean,
             "A property to control whether DEVICES/STATES lists will be sorted or not",
             [True] ],
+        'LogLevel':
+            [PyTango.DevString,
+            "This property selects the log level (DEBUG/INFO/WARNING/ERROR)",
+            ['WARNING'] ],
         }
 
 
@@ -632,6 +698,14 @@ class PyStateComposerClass(PyTango.DeviceClass):
 
     #    Attribute definitions
     attr_list = {
+        'VersionNumber':
+            [[PyTango.DevString,
+            PyTango.SCALAR,
+            PyTango.READ],
+            {
+                'Display level':PyTango.DispLevel.EXPERT,
+                'description':"Version number and release note",
+            } ],
         'StatesList':
             [[PyTango.DevString,
             PyTango.SPECTRUM,
