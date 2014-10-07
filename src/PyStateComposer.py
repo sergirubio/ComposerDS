@@ -374,7 +374,8 @@ class PyStateComposer(PyTango.Device_4Impl):
         
         #Order Matters!
         #self.get_device_properties(self.get_device_class())
-        self.get_DynDS_properties() #LogLevel is already set here
+        try: DynamicDS.init_device(self)
+        except: self.get_DynDS_properties()
         
         #self.setLogLevel(self.LogLevel if hasattr(self,'LogLevel') else 'INFO')
         self.set_state(PyTango.DevState.INIT)
@@ -386,59 +387,58 @@ class PyStateComposer(PyTango.Device_4Impl):
             if not props['DevicesList']: self.DevicesList = props['DeviceNameList']
         self.DeviceNameList = self.DevicesList
         self.IgnoreList = [a for a in self.IgnoreList if a.strip() and not a.startswith('#')]
-        
-        self.DevicesDict = fandango.SortedDict()#fandango.CaselessDict()
-        self.AttributeCache = fandango.CaselessDict()
-        self.History = []
-        
         #Updating StatePriorities dictionary
         self.UpdateStatePolicy(read_properties = False)
         
-        self.info('Updating Device Properties ...')
-        default_props = {
-            'UseEvents':self.UseEvents,
-            'PollingCycle':[self.PollingCycle],
-            } 
-        if not len(self.DynamicStates): default_props['StatePolicy']=self.StatePolicy
-        if not self.DevicesList: default_props['DeviceNameList']=self.DeviceNameList
-        if not len(self.IgnoreList): default_props['IgnoreList']=['']
-        
-        self._db.put_device_property(self.get_name(),dict((k,v if fun.isSequence(v) else [v]) for k,v in default_props.items()))
-        self.info('DevicesList:%s'%self.DevicesList)
-        self.info('IgnoreList:%s'%self.IgnoreList)
-        
-        self.LastStateCheck = 0.
-        self.LastStateUpdate = 0.
-        self.last_event_received = 0.
-        self.set_change_event('State',True,True)
-
-        self.add_event = threading.Event()
-        def add_all(obj=self,wait=True):
-          while wait and not obj.__initialized: 
-            obj.add_event.wait(.1)
-          if obj.SubComposers:
-            obj.SubComposers = [s for s in obj.SubComposers if s]
-            print 'Adding devices from SubComposers list (%s)'%obj.SubComposers
-            obj.SubComposers = dict.fromkeys(obj.SubComposers)
-            for composer in obj.SubComposers:
-                print 'Adding devices from %s'%composer
-                if obj.add_event.is_set(): break
-                obj.SubComposers[composer] = {}
-                obj.AddDeviceToList(composer)
-                if wait: obj.add_event.wait(.1)
-          print 'Adding devices from DevicesList'
-          for device in obj.DevicesList:
-            if obj.add_event.is_set(): break
-            obj.AddDeviceToList(device)
-            if wait: obj.add_event.wait(.1)
-          print('Ready to process events ...')
-          return
-        if False:
-          self.add_thread = threading.Thread(target=add_all)
-          self.add_thread.setDaemon(False)#True)
-          self.add_thread.start()
-        else: add_all(wait=False)
-
+        if not self.__initialized:
+            self.DevicesDict = fandango.SortedDict()#fandango.CaselessDict()
+            self.AttributeCache = fandango.CaselessDict()
+            self.History = []
+            self.LastStateCheck = 0.
+            self.LastStateUpdate = 0.
+            self.last_event_received = 0.
+            self.set_change_event('State',True,True)
+            
+            self.info('Updating Device Properties ...')
+            default_props = {
+                'UseEvents':self.UseEvents,
+                'PollingCycle':[self.PollingCycle],
+                } 
+            if not len(self.DynamicStates): default_props['StatePolicy']=self.StatePolicy
+            if not self.DevicesList: default_props['DeviceNameList']=self.DeviceNameList
+            if not len(self.IgnoreList): default_props['IgnoreList']=['']
+            
+            self._db.put_device_property(self.get_name(),dict((k,v if fun.isSequence(v) else [v]) for k,v in default_props.items()))
+            self.info('DevicesList:%s'%self.DevicesList)
+            self.info('IgnoreList:%s'%self.IgnoreList)
+    
+            self.add_event = threading.Event()
+            def add_all(obj=self,wait=True):
+                while wait and not obj.__initialized: 
+                    obj.add_event.wait(.1)
+                if obj.SubComposers:
+                    obj.SubComposers = [s for s in obj.SubComposers if s]
+                    print 'Adding devices from SubComposers list (%s)'%obj.SubComposers
+                    obj.SubComposers = dict.fromkeys(obj.SubComposers)
+                    for composer in obj.SubComposers:
+                        print 'Adding devices from %s'%composer
+                        if obj.add_event.is_set(): break
+                        obj.SubComposers[composer] = {}
+                        obj.AddDeviceToList(composer)
+                        if wait: obj.add_event.wait(.1)
+                print 'Adding devices from DevicesList'
+                for device in obj.DevicesList:
+                    if obj.add_event.is_set(): break
+                    obj.AddDeviceToList(device)
+                    if wait: obj.add_event.wait(.1)
+                print('Ready to process events ...')
+                return
+            if False:
+                self.add_thread = threading.Thread(target=add_all)
+                self.add_thread.setDaemon(False)#True)
+                self.add_thread.start()
+            else: add_all(wait=False)
+            
         print('#'*80)        
         print('Ready to accept request ...')
         print('#'*80)        
