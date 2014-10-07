@@ -1,4 +1,11 @@
-VERSION = 6.3 - May 2014
+VERSION = 6.4
+
+6.4 - October 2014
+
+Requires Fandango 11.0
+Init() method modified to update all properties w/out stopping the device.
+
+6.3 - May 2014
 
 MultiHost methods from Fandango caused problems to 6.2 release
 @todo: MultiHost has been forced to False until next release
