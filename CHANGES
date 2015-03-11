@@ -1,4 +1,8 @@
-VERSION = 6.4
+VERSION = 6.5beta
+
+ONGOING
+
+Solved bugs on parsing attributes and setting default property values
 
 6.4 - October 2014
 
