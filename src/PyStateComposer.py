@@ -137,8 +137,12 @@ class PyStateComposer(PyTango.Device_4Impl):
                 self.cout('info','Not-tango names ignored ... %s'%source)
             else:
                 params = fandango.tango.parse_tango_model(source)
-                tango_host,dev_name,att,attr_name = '%s:%s'%(params['host'],params['port']),\
-                    params['devicename'],params['attributename'],'%s/%s'%(params['devicename'],params['attributename'])
+                if params:
+                    tango_host,dev_name,att,attr_name = '%s:%s'%(params['host'],params['port']),\
+                        params['devicename'],params['attributename'],'%s/%s'%(params['devicename'],params['attributename'])
+                else: 
+                    self.cout('error','Unparsable source: %s => %s'%(source,params))
+                    tango_host,dev_name,att,attr_name = '','',None,''
                 if 'Error'==fakeEventType[type_] or not hasattr(attr_value,'value'):
                     self.cout('warning','%s Error received: %s'%(attr_name,attr_value))
                     self.AttributeCache[attr_name] = fakeAttributeValue(attr_name,attr_value,time.time(),error=True)
@@ -150,7 +154,7 @@ class PyStateComposer(PyTango.Device_4Impl):
                     self.DevicesDict[dev_name] = fun.notNone(value,PyTango.DevState.UNKNOWN)
                     if self.__initialized: self.evaluateStates()
         except:
-            self.cout('error','Exception in event_received(...):\n%s'%traceback.format_exc())
+            self.cout('error','Exception in event_received(%s,%s,...):\n%s'%(source,type_,traceback.format_exc()))
         self.cout('info','Out of PyStateComposer.event_received()')
         return
 
@@ -322,19 +326,16 @@ class PyStateComposer(PyTango.Device_4Impl):
                 for d in devs:
                     self.AddDeviceToList(d)
             else:
-                argin = fun.isSequence(argin) and argin and argin[0] or argin
-                dev_name = argin.lower()
-                if dev_name==self.get_name().lower():
-                    self.warning("In AddDevice(%s): PyStateComposer doesn't allow recursive composing."%dev_name)
-                    return False
-                else:
-                    try:
-                        self.DevicesDict[dev_name] = PyTango.DevState.INIT
-                        self.subscribe_external_attributes(dev_name,['State'])
-                        self.create_state_attribute(argin)
-                        return True
-                    except:
-                        self.error('Unable to subscribe to %s: %s' % (argin,traceback.format_exc()))
+                dev_name = (fun.isSequence(argin) and argin and argin[0] or argin).lower()
+                assert '/' in dev_name,'%s is not a valid device name!'%dev_name
+                assert dev_name!=self.get_name().lower(),"PyStateComposer doesn't allow recursive composing."
+                try:
+                    self.DevicesDict[dev_name] = PyTango.DevState.INIT
+                    self.subscribe_external_attributes(dev_name,['State'])
+                    self.create_state_attribute(argin)
+                    return True
+                except:
+                    self.error('Unable to subscribe to %s: %s' % (argin,traceback.format_exc()))
         
         except Exception,e:
                 self.error('Exception in AddDevice(): %s' % traceback.format_exc())
@@ -379,14 +380,15 @@ class PyStateComposer(PyTango.Device_4Impl):
         
         #self.setLogLevel(self.LogLevel if hasattr(self,'LogLevel') else 'INFO')
         self.set_state(PyTango.DevState.INIT)
-        self.set_status('Connecting devices ...')
-        
+        st = 'Connecting devices ... '
+        self.set_status(st)
         # If self.DevicesList property is not initialized then DeviceNameList is read instead; this is for Soleil's device compatibility
         if not self.DevicesList:
             props = self._db.get_device_property(self.get_name(),['DeviceNameList','DevicesList'])
             if not props['DevicesList']: self.DevicesList = props['DeviceNameList']
         self.DeviceNameList = self.DevicesList
         self.IgnoreList = [a for a in self.IgnoreList if a.strip() and not a.startswith('#')]
+        #self.info('DevicesList:%s'%self.DevicesList)
         #Updating StatePriorities dictionary
         self.UpdateStatePolicy(read_properties = False)
         
@@ -408,7 +410,7 @@ class PyStateComposer(PyTango.Device_4Impl):
             if not self.DevicesList: default_props['DeviceNameList']=self.DeviceNameList
             if not len(self.IgnoreList): default_props['IgnoreList']=['']
             
-            self._db.put_device_property(self.get_name(),dict((k,v if fun.isSequence(v) else [v]) for k,v in default_props.items()))
+            self._db.put_device_property(self.get_name(),dict((k,(v if len(v) else None) if fun.isSequence(v) else [v]) for k,v in default_props.items()))
             self.info('DevicesList:%s'%self.DevicesList)
             self.info('IgnoreList:%s'%self.IgnoreList)
     
@@ -426,7 +428,7 @@ class PyStateComposer(PyTango.Device_4Impl):
                         obj.SubComposers[composer] = {}
                         obj.AddDeviceToList(composer)
                         if wait: obj.add_event.wait(.1)
-                print 'Adding devices from DevicesList'
+                print 'Adding devices from DevicesList(%s(%s))'%(type(self.DevicesList),self.DevicesList)
                 for device in obj.DevicesList:
                     if obj.add_event.is_set(): break
                     obj.AddDeviceToList(device)
