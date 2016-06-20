@@ -745,23 +745,27 @@ class PyStateComposerClass(PyTango.DeviceClass):
 #    PyStateComposer class main method
 #
 #==================================================================
-if __name__ == '__main__':
+
+PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
+PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,Dev4Tango,PyTango.DeviceClass,ForceDevImpl=False)
+
+def main():
+    #@staticmethod
+    #def main():
     try:
         py = ('PyUtil' in dir(PyTango) and PyTango.PyUtil or PyTango.Util)(sys.argv)
-        PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
-        PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,Dev4Tango,PyTango.DeviceClass,ForceDevImpl=False)
-        py.add_TgClass(PyStateComposerClass,PyStateComposer,'PyStateComposer')
-
+        py.add_TgClass(PyStateComposerClass,PyStateComposer,'PyStateComposer')        
         U = PyTango.Util.instance()
         CreateDynamicCommands(PyStateComposer,PyStateComposerClass)
         U.server_init()
         U.server_run()
 
     except PyTango.DevFailed,e:
-        print '-------> Received a DevFailed exception:',e
+        print '-------> Received a DevFailed exception:',traceback.format_exc()
     except Exception,e:
-        print '-------> An unforeseen exception occured....',e
-else:
-    PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,DynamicDS,DynamicDSClass,ForceDevImpl=True)
-    PyStateComposer,PyStateComposerClass=FullTangoInheritance('PyStateComposer',PyStateComposer,PyStateComposerClass,Dev4Tango,PyTango.DeviceClass,ForceDevImpl=False)
-
+        print '-------> An unforeseen exception occured....',traceback.format_exc()    
+        
+    PyStateComposer.main()
+    
+if __name__ == '__main__':
+    main()
