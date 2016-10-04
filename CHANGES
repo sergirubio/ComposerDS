@@ -1,3 +1,10 @@
+7.0 - October 2016
+
+Override getXAttr to ignore
+attributes from devices when
+state in BadStates property list.
+
+
 VERSION = 6.5beta
 
 ONGOING
