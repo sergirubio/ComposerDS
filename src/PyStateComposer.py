@@ -53,7 +53,7 @@ from fandango import DynamicDS,DynamicDSClass,DynamicAttribute
 from fandango.interface import FullTangoInheritance
 from fandango.dynamic import CreateDynamicCommands,USE_STATIC_METHODS
 from fandango.device import Dev4Tango,fakeEventType,get_matching_devices,get_database
-from fandango.tango import fakeAttributeValue
+from fandango.tango import fakeAttributeValue,parse_tango_model
 
 from fandango import CaselessList
 
@@ -138,7 +138,7 @@ class PyStateComposer(PyTango.Device_4Impl):
             elif '/' not in source:
                 self.cout('info','Not-tango names ignored ... %s'%source)
             else:
-                params = fandango.tango.parse_tango_model(source)
+                params = parse_tango_model(source)
                 if params:
                     tango_host,dev_name,att,attr_name = '%s:%s'%(params['host'],params['port']),\
                         params['devicename'],params['attributename'],'%s/%s'%(params['devicename'],params['attributename'])
@@ -169,11 +169,37 @@ class PyStateComposer(PyTango.Device_4Impl):
                 states = self.getXAttr(composer+'/StatesList')
                 try:
                     self.SubComposers[composer].update(zip(devs,states))
-                    [(self._locals['DEVICES'].append(k),self._locals['STATES'].append(v)) for k,v in sorted(zip(devs,states))]
+                    for k,v in sorted(zip(devs,states)):
+                      self._locals['DEVICES'].append(k)
+                      self._locals['STATES'][k] = v
                 except:
                     self.error('Unable to import states from %s:\ndevs:%s\nstates:%s\n%s' % (composer,str(devs),str(states),traceback.format_exc()))
         return
-                        
+      
+    def checkState(self,model,check=False):
+        """
+        This method will check if the state of the model device appears in the BadStates list.
+        If it is not the case, True will be returned.
+        """
+        try:
+          dev_name = parse_tango_model(model)['devicename'].lower()
+          state = self.DevicesDict.get(dev_name,None if not check else fandango.check_device(dev_name))
+          #self.info('checkState(%s): %s => %s'%(model,dev_name,state))
+          assert (str(state) not in self.BadStates and not isinstance(state,Exception))
+          return True
+        except:
+          #traceback.print_exc()
+          return False
+        
+    def getXAttr(self,aname,default=None,write=False,wvalue=None):
+        """
+        Overriding DynamicDS.getXAttr to return default value in case device is not available
+        """
+        if not self.checkState(aname): 
+          return default
+        else:
+          return DynamicDS.getXAttr(self,aname,default,write,wvalue)
+        
     def evaluateStates(self):
         '''
         This method is called from push_event, always_executed_hook, AddDeviceToList and RemoveDevice methods; It depends of UseEvents property.
@@ -195,7 +221,8 @@ class PyStateComposer(PyTango.Device_4Impl):
             #publishing Devices and States for Dynamic Attributes and States
             self._locals['DEVICES'] = CaselessList(self.DevicesDict.keys())
             if self.SortLists: self._locals['DEVICES'] = sorted(self._locals['DEVICES'])
-            self._locals['STATES'] = [self.DevicesDict[k] for k in self._locals['DEVICES']]
+            self._locals['STATES'] = self.DevicesDict.copy()
+            self._locals['CHECK'] = self.checkState
             self._locals['IGNORED'] = []
             
             if not self.DevicesDict:
@@ -262,7 +289,7 @@ class PyStateComposer(PyTango.Device_4Impl):
                 
                 status = '%s is in %s State since %s.\n'%(self.get_name(),self.get_state(),time.ctime(self.LastStateUpdate))
                 status += 'DevicesList:\n'
-                for dev,state in zip(self._locals['DEVICES'],self._locals['STATES']):
+                for dev,state in sorted(self.DevicesDict.items()):
                     status += dev + ':\t' + str(state) + '\n'
                 status = result+status+'\nLast Changes:\n'
                 for d,h in self.History: status+='%s: %s'%(time.ctime(d),h)
@@ -455,12 +482,15 @@ class PyStateComposer(PyTango.Device_4Impl):
         #print "In ", self.get_name(), "::always_executed_hook()"
         self.debug("In ::always_executed_hook()")
         DynamicDS.always_executed_hook(self)
-        if (self.LastStateCheck+5e-3*self.PollingCycle)<time.time():
+        if (self.LastStateCheck+1e-3*self.PollingCycle)<time.time():
             self.evaluateStates()
         else:
             self._locals['DEVICES'] = CaselessList(self.DevicesDict.keys())
             if self.SortLists: self._locals['DEVICES'] = sorted(self._locals['DEVICES'])
-            self._locals['STATES'] = [self.DevicesDict[k] for k in self._locals['DEVICES']]
+            self._locals['STATES'].update(self.DevicesDict.items())
+            for v in self.DevicesDict.values():
+              # States will also contain a counter of occurrences for each state
+              self._locals['STATES'][str(v)] = 1+self._locals['STATES'].get(str(v),0)
 
 #==================================================================
 #
@@ -495,8 +525,8 @@ class PyStateComposer(PyTango.Device_4Impl):
         
         #    Add your own code here
         
-        attr_StatesList_read = []
-        [attr_StatesList_read.append(str(v)) for k,v in self.DevicesDict.items()]
+        attr_StatesList_read,meth = [],(sorted if self.SortLists else list)
+        [attr_StatesList_read.append(str(v)) for k,v in meth(self.DevicesDict.items())]
         if self.SubComposers:
             [[attr_StatesList_read.append(v) for k,v in sorted(self.SubComposers[c].items())] for c in sorted(self.SubComposers)]
         attr.set_value(attr_StatesList_read, len(attr_StatesList_read))
@@ -527,11 +557,10 @@ class PyStateComposer(PyTango.Device_4Impl):
         
         #    Add your own code here
         attr_DevStates_read = []
-        if hasattr(self,'_locals'):
-            devs,states = self._locals['DEVICES'],self._locals['STATES']
-            for d,s in zip(devs,states):
-                attr_DevStates_read.append(str(d))
-                attr_DevStates_read.append(str(s))
+        names = (sorted if self.SortLists else list)(self.DevicesDict.keys())
+        for d in names:
+            attr_DevStates_read.append(str(d))
+            attr_DevStates_read.append(str(self.DevicesDict(d)))
         attr.set_value(attr_DevStates_read, len(attr_DevStates_read))
 
 
@@ -675,9 +704,13 @@ class PyStateComposerClass(PyTango.DeviceClass):
             [PyTango.DevVarStringArray,
             "A list of States and its priority. this property is not used if DynamicStates has been initialized.",
             [] ],
+        'BadStates':
+            [PyTango.DevVarStringArray,
+            "Attributes from devices with these states will be not evaluated.",
+            [ 'None','INIT','UNKNOWN' ] ],
         'SortLists':
             [PyTango.DevBoolean,
-            "A property to control whether DEVICES/STATES lists will be sorted or not",
+            "A property to control whether DEVICES lists will be sorted or not",
             [True] ],
         'LogLevel':
             [PyTango.DevString,
