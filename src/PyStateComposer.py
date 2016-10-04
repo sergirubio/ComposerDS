@@ -183,7 +183,7 @@ class PyStateComposer(PyTango.Device_4Impl):
         """
         try:
           dev_name = parse_tango_model(model)['devicename'].lower()
-          state = self.DevicesDict.get(dev_name,None if not check else fandango.check_device(dev_name))
+          state = self.DevicesDict.get(dev_name,True if not check else fandango.check_device(dev_name))
           #self.info('checkState(%s): %s => %s'%(model,dev_name,state))
           assert (str(state) not in self.BadStates and not isinstance(state,Exception))
           return True
