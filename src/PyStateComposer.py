@@ -195,7 +195,8 @@ class PyStateComposer(PyTango.Device_4Impl):
         """
         Overriding DynamicDS.getXAttr to return default value in case device is not available
         """
-        if not self.checkState(aname): 
+        if '/' in aname and not self.checkState(aname): 
+          self.warning('%s is not readable.'%aname)
           return default
         else:
           return DynamicDS.getXAttr(self,aname,default,write,wvalue)
@@ -707,7 +708,7 @@ class PyStateComposerClass(PyTango.DeviceClass):
         'BadStates':
             [PyTango.DevVarStringArray,
             "Attributes from devices with these states will be not evaluated.",
-            [ 'None','INIT','UNKNOWN' ] ],
+            [ 'None' ] ],
         'SortLists':
             [PyTango.DevBoolean,
             "A property to control whether DEVICES lists will be sorted or not",
